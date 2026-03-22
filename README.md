@@ -1,4 +1,4 @@
-# TelegramForwarder
+# TG转发
 
 一个带中文 Web 控制台的 Telegram 转发工具。
 
