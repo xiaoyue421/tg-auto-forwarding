@@ -1,0 +1,26 @@
+services:
+  tg-forwarder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.12-slim}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+    container_name: tg-forwarder
+    restart: unless-stopped
+    working_dir: /workspace
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /workspace/src
+      TG_QUEUE_DB_PATH: /data/tg_forwarder_queue.sqlite3
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/workspace
+      - tg_forwarder_data:/data
+    command: ["python", "-m", "tg_forwarder", "web", "--config", "/workspace/.env", "--host", "0.0.0.0", "--port", "8080"]
+
+volumes:
+  tg_forwarder_data:

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tg-forwarder"
+version = "0.1.0"
+description = "Telegram forwarding dashboard with multi-rule filtering, account/Bot delivery, history search, and Docker support."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "Telethon>=1.42.0,<2.0.0",
+  "PyYAML>=6.0.2,<7.0.0",
+  "python-dotenv>=1.0.1,<2.0.0",
+  "python-socks[asyncio]>=2.5.3,<3.0.0",
+  "fastapi>=0.115.0,<1.0.0",
+  "uvicorn>=0.32.0,<1.0.0",
+]
+
+[project.scripts]
+tg-forwarder = "tg_forwarder.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tg_forwarder = ["web/static/*"]
