@@ -1,0 +1,2127 @@
+const { createApp } = Vue;
+
+function createRule(name = "rule_1") {
+  return {
+    name,
+    enabled: true,
+    source_chat: "",
+    target_chats: "",
+    bot_target_chats: "",
+    forward_strategy: "inherit",
+    include_edits: false,
+    forward_own_messages: false,
+    keywords_any: "",
+    keywords_all: "",
+    block_keywords: "",
+    regex_any: "",
+    regex_all: "",
+    regex_block: "",
+    resource_presets: [],
+    media_only: false,
+    text_only: false,
+    content_match_mode: "all",
+    case_sensitive: false,
+  };
+}
+
+function createConfig() {
+  return {
+    api_id: "",
+    api_hash: "",
+    session_string: "",
+    bot_token: "",
+    forward_strategy: "parallel",
+    rate_limit_protection: false,
+    rate_limit_delay_seconds: 1.2,
+    startup_notify_enabled: false,
+    startup_notify_message: "",
+    proxy_type: "socks5",
+    proxy_host: "",
+    proxy_port: "",
+    proxy_user: "",
+    proxy_password: "",
+    proxy_rdns: true,
+    search_default_mode: "fast",
+    rules: [createRule()],
+  };
+}
+
+function createForwardStrategyOptions() {
+  return [
+    {
+      value: "account_only",
+      label: "只用账号发送",
+      help: "只用登录的用户账号发送，不会尝试 Bot。",
+    },
+    {
+      value: "bot_only",
+      label: "只用 Bot 发送",
+      help: "只用 Bot 发送，不会回退到用户账号。",
+    },
+    {
+      value: "parallel",
+      label: "同时转发（账号和 Bot 都发）",
+      help: "当你同时填了账号目标和 Bot 目标时，两边会同时尝试转发。",
+    },
+    {
+      value: "account_first",
+      label: "优先账号（失败后再试 Bot）",
+      help: "先用登录账号转发，只有账号这一轮没有成功发出去时，才会回退到 Bot 转发。",
+    },
+    {
+      value: "bot_first",
+      label: "优先 Bot（失败后再试账号）",
+      help: "先用 Bot 转发，只有 Bot 这一轮没有成功发出去时，才会回退到登录账号转发。",
+    },
+  ];
+}
+
+function createRuleForwardStrategyOptions() {
+  return [
+    {
+      value: "inherit",
+      label: "跟随全局",
+      help: "这条规则直接使用“基础配置”里的全局发送策略。",
+    },
+    ...createForwardStrategyOptions(),
+  ];
+}
+
+function createSearchState() {
+  return {
+    query: "",
+    limit: 20,
+    loading: false,
+    forwardingKey: "",
+    sourceFilter: "all",
+    results: [],
+  };
+}
+
+function createResourcePresetOptions() {
+  return [
+    { value: "115cdn", label: "115 资源", help: "识别 115cdn 链接" },
+    { value: "ed2k", label: "ed2k", help: "识别 ed2k:// 下载地址" },
+    { value: "magnet", label: "磁力", help: "识别 magnet: 磁力链接" },
+    { value: "thunder", label: "迅雷", help: "识别 thunder:// 链接" },
+    { value: "quark", label: "夸克 / UC", help: "识别 pan.quark.cn 和 drive.uc.cn" },
+    { value: "aliyun", label: "阿里云盘", help: "识别 aliyundrive / alipan" },
+    { value: "baidu", label: "百度网盘", help: "识别 pan.baidu / yun.baidu" },
+  ];
+}
+
+function createTelegramLoginState() {
+  return {
+    phone: "",
+    code: "",
+    password: "",
+    loginId: "",
+    step: "idle",
+    busy: false,
+  };
+}
+
+const MONITOR_FIELD_MAP = {
+  "\u6a21\u5f0f": "mode",
+  "\u89c4\u5219": "ruleName",
+  "\u6765\u6e90": "source",
+  "\u76ee\u6807": "target",
+  "\u6d88\u606fID": "messageId",
+  "\u7c7b\u578b": "messageType",
+  "\u5185\u5bb9": "preview",
+};
+
+const DISPATCH_SUCCESS_ACTIONS = new Set([
+  "\u8d26\u53f7\u8f6c\u53d1\u6210\u529f",
+  "\u8d26\u53f7\u91cd\u8bd5\u540e\u8f6c\u53d1\u6210\u529f",
+  "Bot \u76f4\u8f6c\u6210\u529f",
+  "Bot \u91cd\u8bd5\u540e\u76f4\u8f6c\u6210\u529f",
+  "Bot \u590d\u5236\u6587\u672c\u6210\u529f",
+  "Bot \u590d\u5236\u5a92\u4f53\u6210\u529f",
+]);
+
+function parseDispatchMonitorItem(item = {}) {
+  const rawMessage = String(item.raw_message || item.message || "").trim();
+  const parts = rawMessage
+    .split(" | ")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const parsed = {
+    ...item,
+    action: parts[0] || "",
+    mode: "",
+    ruleName: "",
+    source: "",
+    target: "",
+    messageId: "",
+    messageType: "",
+    preview: "",
+    note: "",
+    isSuccessDispatch: false,
+    channelLabel: "",
+    channelTone: "muted",
+    modeTone: "muted",
+  };
+  const extras = [];
+  for (const part of parts.slice(1)) {
+    const separatorIndex = part.indexOf("=");
+    if (separatorIndex <= 0) {
+      extras.push(part);
+      continue;
+    }
+    const key = part.slice(0, separatorIndex).trim();
+    const value = part.slice(separatorIndex + 1).trim();
+    const mappedKey = MONITOR_FIELD_MAP[key];
+    if (!mappedKey) {
+      extras.push(part);
+      continue;
+    }
+    parsed[mappedKey] = value;
+  }
+  parsed.note = extras.join(" | ");
+  parsed.isSuccessDispatch = DISPATCH_SUCCESS_ACTIONS.has(parsed.action);
+  parsed.channelLabel = parsed.action.startsWith("Bot") ? "Bot" : "\u8d26\u53f7";
+  parsed.channelTone = parsed.action.startsWith("Bot") ? "warn" : "good";
+  parsed.modeTone = String(parsed.mode || "").includes("\u961f\u5217") ? "warn" : "muted";
+  return parsed;
+}
+
+createApp({
+  data() {
+    return {
+      loading: false,
+      saving: false,
+      validating: false,
+      actionBusy: false,
+      authBusy: false,
+      authed: false,
+      passwordInput: localStorage.getItem("tg_dashboard_password") || "",
+      notice: "",
+      error: "",
+      configPath: "",
+      defaultStartupNotifyMessage: "",
+      config: createConfig(),
+      forwardStrategyOptions: createForwardStrategyOptions(),
+      ruleForwardStrategyOptions: createRuleForwardStrategyOptions(),
+      resourcePresetOptions: createResourcePresetOptions(),
+      search: createSearchState(),
+      telegramLogin: createTelegramLoginState(),
+      status: {
+        status: "stopped",
+        config_path: "",
+        last_error: null,
+        snapshot: null,
+      },
+      queue: {
+        failedItems: [],
+        actionBusy: false,
+        successHistoryTotalCount: 0,
+        successHistoryRules: [],
+        successHistoryRuleName: "",
+      },
+      validation: null,
+      logs: [],
+      timers: [],
+      ui: {
+        activeTab: "rules",
+        expandedRuleIndex: 0,
+        showSessionString: false,
+        showBotToken: false,
+        logFilter: "monitor",
+        showBackToTop: false,
+        showLogBottom: false,
+      },
+    };
+  },
+  computed: {
+    statusTone() {
+      switch (this.status.status) {
+        case "running":
+          return "good";
+        case "starting":
+        case "stopping":
+          return "warn";
+        case "error":
+          return "bad";
+        default:
+          return "muted";
+      }
+    },
+    statusText() {
+      const map = {
+        running: "运行中",
+        starting: "启动中",
+        stopping: "停止中",
+        stopped: "已停止",
+        error: "错误",
+      };
+      return map[this.status.status] || "未知";
+    },
+    workerCards() {
+      return this.status.snapshot?.workers || [];
+    },
+    statusRateLimitEnabled() {
+      return Boolean(this.status.snapshot?.rate_limit_protection_enabled);
+    },
+    statusRateLimitDelaySeconds() {
+      return this.normalizeNonNegativeNumber(
+        this.status.snapshot?.rate_limit_delay_seconds,
+        this.config.rate_limit_delay_seconds,
+      );
+    },
+    statusGlobalQueueDepth() {
+      return Math.floor(
+        this.normalizeNonNegativeNumber(this.status.snapshot?.global_queue_depth, 0),
+      );
+    },
+    statusGlobalQueueFailed() {
+      return Math.floor(
+        this.normalizeNonNegativeNumber(this.status.snapshot?.global_queue_failed, 0),
+      );
+    },
+    statusGlobalQueueDeliveryDepth() {
+      return Math.floor(
+        this.normalizeNonNegativeNumber(this.status.snapshot?.global_queue_delivery_depth, 0),
+      );
+    },
+    statusGlobalQueueDeliveryFailed() {
+      return Math.floor(
+        this.normalizeNonNegativeNumber(this.status.snapshot?.global_queue_delivery_failed, 0),
+      );
+    },
+    dispatcherAlive() {
+      return Boolean(this.status.snapshot?.dispatcher_alive);
+    },
+    dispatcherPid() {
+      return this.status.snapshot?.dispatcher_pid || "";
+    },
+    statusQueueDbPath() {
+      return this.status.snapshot?.queue_db_path || "";
+    },
+    failedQueueItems() {
+      return this.queue.failedItems || [];
+    },
+    successHistoryRules() {
+      return this.queue.successHistoryRules || [];
+    },
+    selectedSuccessHistoryRule() {
+      return (
+        this.successHistoryRules.find(
+          (item) => item.rule_name === this.queue.successHistoryRuleName,
+        ) || null
+      );
+    },
+    selectedSuccessHistoryCount() {
+      return Number(this.selectedSuccessHistoryRule?.count || 0);
+    },
+    recentSuccessfulDispatches() {
+      return this.sortedLogs
+        .filter((item) => this.isMonitorLog(item))
+        .map((item) => parseDispatchMonitorItem(item))
+        .filter((item) => item.isSuccessDispatch)
+        .slice(0, 12);
+    },
+    statusRateLimitText() {
+      if (!this.status.snapshot) {
+        return "";
+      }
+      if (!this.statusRateLimitEnabled) {
+        return "\u81ea\u52a8\u6d88\u606f\u4f1a\u5148\u8fdb\u5165\u53d1\u9001\u961f\u5217\uff0c\u76ee\u524d\u672a\u5f00\u542f\u989d\u5916\u9650\u6d41";
+      }
+      return `\u81ea\u52a8\u6d88\u606f\u4f1a\u5148\u8fdb\u5165\u53d1\u9001\u961f\u5217\uff0c\u5df2\u5f00\u542f\u9650\u6d41\uff0c\u95f4\u9694 ${this.formatSeconds(this.statusRateLimitDelaySeconds)}`;
+    },
+    ruleCount() {
+      return this.config.rules.length;
+    },
+    enabledRuleCount() {
+      return this.config.rules.filter((rule) => rule.enabled).length;
+    },
+    runningWorkerCount() {
+      return this.workerCards.filter((worker) => worker.is_alive).length;
+    },
+    searchResultCount() {
+      return this.search.results.length;
+    },
+    searchVisibleCount() {
+      return this.filteredSearchResults.length;
+    },
+    hasSessionString() {
+      return Boolean((this.config.session_string || "").trim());
+    },
+    forwardStrategyHelpText() {
+      const current = this.forwardStrategyOptions.find(
+        (item) => item.value === this.config.forward_strategy,
+      );
+      return (
+        current?.help ||
+        "\u5f53\u4f60\u540c\u65f6\u586b\u4e86\u8d26\u53f7\u76ee\u6807\u548c Bot \u76ee\u6807\u65f6\uff0c\u53ef\u4ee5\u5728\u8fd9\u91cc\u51b3\u5b9a\u8c01\u5148\u8f6c\u53d1\u3002"
+      );
+    },
+    sortedLogs() {
+      return this.sortLogsNewestFirst(this.logs);
+    },
+    monitorLogCount() {
+      return this.sortedLogs.filter((item) => this.isMonitorLog(item)).length;
+    },
+    errorLogCount() {
+      return this.sortedLogs.filter((item) => item.level === "ERROR").length;
+    },
+    canSearch() {
+      return Boolean(this.normalizeSearchQuery(this.search.query));
+    },
+    searchSourceOptions() {
+      const groups = new Map();
+      for (const item of this.search.results) {
+        const key = item.source_key || item.source_chat || item.source_label || "unknown_source";
+        if (!groups.has(key)) {
+          groups.set(key, {
+            key,
+            label: item.source_label || item.source_chat || "未知频道",
+            count: 0,
+          });
+        }
+        groups.get(key).count += 1;
+      }
+      return [
+        {
+          key: "all",
+          label: "全部",
+          count: this.search.results.length,
+        },
+        ...Array.from(groups.values()),
+      ];
+    },
+    activeSearchSourceOption() {
+      return (
+        this.searchSourceOptions.find((item) => item.key === this.search.sourceFilter) ||
+        this.searchSourceOptions[0] || {
+          key: "all",
+          label: "全部",
+          count: 0,
+        }
+      );
+    },
+    filteredSearchResults() {
+      if (this.search.sourceFilter === "all") {
+        return this.search.results;
+      }
+      return this.search.results.filter((item) => {
+        const key = item.source_key || item.source_chat || item.source_label || "unknown_source";
+        return key === this.search.sourceFilter;
+      });
+    },
+    filteredLogs() {
+      return this.getLogsByFilter(this.ui.logFilter);
+    },
+    tabItems() {
+      return [
+        { key: "config", label: "基础配置" },
+        { key: "rules", label: `规则 ${this.ruleCount}` },
+        { key: "search", label: `搜索 ${this.searchResultCount}` },
+        { key: "status", label: `状态 ${this.runningWorkerCount}` },
+        { key: "logs", label: "日志" },
+      ];
+    },
+  },
+  mounted() {
+    window.addEventListener("scroll", this.handleWindowScroll, { passive: true });
+    this.handleWindowScroll();
+    if (this.passwordInput) {
+      this.login();
+    }
+  },
+  beforeUnmount() {
+    window.removeEventListener("scroll", this.handleWindowScroll);
+    this.stopPolling();
+  },
+  methods: {
+    handleWindowScroll() {
+      this.ui.showBackToTop = window.scrollY > 420;
+    },
+    scrollToTop() {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    },
+    normalizeNonNegativeNumber(value, fallback = 0) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric < 0) {
+        const fallbackNumber = Number(fallback);
+        return Number.isFinite(fallbackNumber) && fallbackNumber >= 0 ? fallbackNumber : 0;
+      }
+      return numeric;
+    },
+    normalizeRateLimitDelayInput(value) {
+      return this.normalizeNonNegativeNumber(value, 1.2);
+    },
+    formatSeconds(value) {
+      const numeric = this.normalizeNonNegativeNumber(value, 0);
+      const text = Number.isInteger(numeric)
+        ? numeric.toFixed(0)
+        : numeric.toFixed(1).replace(/\.0$/, "");
+      return `${text} \u79d2`;
+    },
+    getDefaultStartupNotifyMessage() {
+      return String(this.defaultStartupNotifyMessage || "");
+    },
+    resolveStartupNotifyMessage(value) {
+      const text = String(value || "");
+      return this.normalizeMultilineText(text)
+        ? text
+        : this.getDefaultStartupNotifyMessage();
+    },
+    serializeStartupNotifyMessage(value) {
+      const text = String(value || "");
+      const normalizedText = this.normalizeMultilineText(text);
+      const normalizedDefault = this.normalizeMultilineText(this.getDefaultStartupNotifyMessage());
+      if (!normalizedText) {
+        return "";
+      }
+      if (normalizedDefault && normalizedText === normalizedDefault) {
+        return "";
+      }
+      return text;
+    },
+    normalizeMultilineText(value) {
+      return String(value || "").replace(/\r\n/g, "\n").trim();
+    },
+    getForwardStrategyLabel(value) {
+      const current = this.forwardStrategyOptions.find((item) => item.value === value);
+      return current?.label || value || "parallel";
+    },
+    getRuleForwardStrategyLabel(value) {
+      const current = this.ruleForwardStrategyOptions.find((item) => item.value === value);
+      return current?.label || this.getForwardStrategyLabel(value);
+    },
+    getRuleForwardStrategyHelpText(value) {
+      const current = this.ruleForwardStrategyOptions.find((item) => item.value === value);
+      return current?.help || "";
+    },
+    buildManualForwardNotice(response) {
+      const accountCount = Number(response.data?.account_sent || 0);
+      const botCount = Number(response.data?.bot_sent || 0);
+      const attemptedAccount = Boolean(response.data?.attempted_account);
+      const attemptedBot = Boolean(response.data?.attempted_bot);
+      const summary = [];
+      if (attemptedAccount) {
+        summary.push(`\u8d26\u53f7\u6210\u529f ${accountCount} \u4e2a`);
+      }
+      if (attemptedBot) {
+        summary.push(`Bot \u6210\u529f ${botCount} \u4e2a`);
+      }
+      const strategyLabel = this.getForwardStrategyLabel(
+        response.data?.forward_strategy || this.config.forward_strategy,
+      );
+      return summary.length
+        ? `${response.message} ${strategyLabel} | ${summary.join(" | ")}`
+        : `${response.message} ${strategyLabel}`;
+    },
+    handleLogBoxScroll() {
+      this.syncLogBoxState();
+    },
+    syncLogBoxState() {
+      const logBox = this.$refs.logBox;
+      if (!logBox || this.ui.activeTab !== "logs") {
+        this.ui.showLogBottom = false;
+        return;
+      }
+      const maxScrollTop = Math.max(0, logBox.scrollHeight - logBox.clientHeight);
+      this.ui.showLogBottom = maxScrollTop > 24 && logBox.scrollTop < maxScrollTop - 24;
+    },
+    scrollLogBoxToBottom() {
+      const logBox = this.$refs.logBox;
+      if (!logBox) {
+        return;
+      }
+      logBox.scrollTo({ top: logBox.scrollHeight, behavior: "smooth" });
+      window.setTimeout(() => this.syncLogBoxState(), 220);
+    },
+    authHeaders() {
+      return this.passwordInput
+        ? { "X-Dashboard-Password": this.passwordInput }
+        : {};
+    },
+    normalizeRule(rule = {}, index = 0) {
+      const normalizedPresets = Array.isArray(rule.resource_presets)
+        ? rule.resource_presets.map((item) => String(item || "").trim()).filter(Boolean)
+        : [];
+      return {
+        ...createRule(`rule_${index + 1}`),
+        ...rule,
+        name: (rule.name || `rule_${index + 1}`).trim(),
+        forward_strategy: String(rule.forward_strategy || "inherit").trim() || "inherit",
+        regex_any: this.normalizeMultilineText(rule.regex_any || ""),
+        regex_all: this.normalizeMultilineText(rule.regex_all || ""),
+        regex_block: this.normalizeMultilineText(rule.regex_block || ""),
+        resource_presets: Array.from(new Set(normalizedPresets)),
+      };
+    },
+    normalizeConfig(payload = {}) {
+      const base = createConfig();
+      const rules =
+        Array.isArray(payload.rules) && payload.rules.length
+          ? payload.rules.map((rule, index) => this.normalizeRule(rule, index))
+          : [createRule("rule_1")];
+      return {
+        ...base,
+        ...payload,
+        rate_limit_delay_seconds: this.normalizeRateLimitDelayInput(
+          payload.rate_limit_delay_seconds,
+        ),
+        startup_notify_message: this.resolveStartupNotifyMessage(payload.startup_notify_message),
+        rules,
+      };
+    },
+    normalizeSearchResult(item = {}) {
+      return {
+        ...item,
+        source_key: item.source_chat || item.source_label || "unknown_source",
+      };
+    },
+    splitList(value) {
+      return String(value || "")
+        .split(/[,;\r\n]+/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+    },
+    splitRegexLines(value) {
+      return String(value || "")
+        .replace(/\r\n/g, "\n")
+        .split("\n")
+        .map((item) => item.trim())
+        .filter(Boolean);
+    },
+    resultKey(result) {
+      return `${result.source_chat}:${result.message_id}`;
+    },
+    formatDateTime(value) {
+      if (!value) {
+        return "";
+      }
+      try {
+        if (typeof value === "number") {
+          return new Date(value * 1000).toLocaleString("zh-CN", { hour12: false });
+        }
+        return new Date(value).toLocaleString("zh-CN", { hour12: false });
+      } catch (_err) {
+        return value;
+      }
+    },
+    isMonitorLog(item = {}) {
+      return Boolean(item.monitor);
+    },
+    normalizeSearchQuery(value) {
+      return String(value || "").trim();
+    },
+    hasForwardTargets(result = {}) {
+      return Boolean(result.default_target_chats || result.default_bot_target_chats);
+    },
+    displayLogMessage(item = {}) {
+      return item.raw_message || item.message || "";
+    },
+    syncSearchSourceFilter() {
+      if (this.search.sourceFilter === "all") {
+        return;
+      }
+      const exists = this.search.results.some(
+        (item) => (item.source_key || item.source_chat || item.source_label || "unknown_source") === this.search.sourceFilter,
+      );
+      if (!exists) {
+        this.search.sourceFilter = "all";
+      }
+    },
+    getLogsByFilter(filter) {
+      if (filter === "monitor") {
+        return this.sortedLogs.filter((item) => this.isMonitorLog(item));
+      }
+      if (filter === "error") {
+        return this.sortedLogs.filter((item) => item.level === "ERROR");
+      }
+      return this.sortedLogs;
+    },
+    stringifyErrorPart(value) {
+      if (value === null || value === undefined) {
+        return "";
+      }
+      if (typeof value === "string") {
+        return value.trim();
+      }
+      if (typeof value === "number" || typeof value === "boolean") {
+        return String(value);
+      }
+      if (Array.isArray(value)) {
+        return value
+          .map((item) => this.stringifyErrorPart(item))
+          .filter(Boolean)
+          .join("；");
+      }
+      if (typeof value === "object") {
+        return (
+          this.stringifyErrorPart(value.detail) ||
+          this.stringifyErrorPart(value.message) ||
+          this.stringifyErrorPart(value.msg) ||
+          this.stringifyErrorPart(value.error) ||
+          this.stringifyErrorPart(value.reason) ||
+          JSON.stringify(value)
+        );
+      }
+      return String(value);
+    },
+    formatApiError(payload = {}) {
+      return (
+        this.stringifyErrorPart(payload?.detail) ||
+        this.stringifyErrorPart(payload?.message) ||
+        "请求失败"
+      );
+    },
+    normalizeCaughtError(err) {
+      return (
+        this.stringifyErrorPart(err?.message) ||
+        this.stringifyErrorPart(err) ||
+        "请求失败"
+      );
+    },
+    sortLogsNewestFirst(items = []) {
+      return items
+        .map((item, index) => ({ item, index }))
+        .sort((left, right) => {
+          const sequenceDiff = Number(right.item.sequence || 0) - Number(left.item.sequence || 0);
+          if (sequenceDiff !== 0) {
+            return sequenceDiff;
+          }
+          const timeDiff = Number(right.item.created_at || 0) - Number(left.item.created_at || 0);
+          if (timeDiff !== 0) {
+            return timeDiff;
+          }
+          return right.index - left.index;
+        })
+        .map((entry) => entry.item);
+    },
+    nextRuleName() {
+      const usedNames = new Set(
+        this.config.rules.map((rule) => (rule.name || "").trim()).filter(Boolean),
+      );
+      let index = this.config.rules.length + 1;
+      let candidate = `rule_${index}`;
+      while (usedNames.has(candidate)) {
+        index += 1;
+        candidate = `rule_${index}`;
+      }
+      return candidate;
+    },
+    buildCopyName(name) {
+      const base = (name || "rule").trim() || "rule";
+      const usedNames = new Set(
+        this.config.rules.map((rule) => (rule.name || "").trim()).filter(Boolean),
+      );
+      let suffix = 1;
+      let candidate = `${base}_copy`;
+      while (usedNames.has(candidate)) {
+        suffix += 1;
+        candidate = `${base}_copy_${suffix}`;
+      }
+      return candidate;
+    },
+    setActiveTab(key) {
+      this.ui.activeTab = key;
+      this.$nextTick(() => this.syncLogBoxState());
+    },
+    setLogFilter(filter) {
+      this.ui.logFilter = filter;
+      this.$nextTick(() => this.syncLogBoxState());
+    },
+    expandRule(index) {
+      this.ui.expandedRuleIndex = index;
+      this.ui.activeTab = "rules";
+    },
+    toggleRule(index) {
+      this.ui.expandedRuleIndex = this.ui.expandedRuleIndex === index ? -1 : index;
+    },
+    isRuleExpanded(index) {
+      return this.ui.expandedRuleIndex === index;
+    },
+    countRuleTargets(rule) {
+      return this.splitList(rule.target_chats).length;
+    },
+    countRuleBotTargets(rule) {
+      return this.splitList(rule.bot_target_chats).length;
+    },
+    countRuleFilters(rule) {
+      let count = 0;
+      count += this.splitList(rule.keywords_any).length;
+      count += this.splitList(rule.keywords_all).length;
+      count += this.splitList(rule.block_keywords).length;
+      count += this.splitRegexLines(rule.regex_any).length;
+      count += this.splitRegexLines(rule.regex_all).length;
+      count += this.splitRegexLines(rule.regex_block).length;
+      count += Array.isArray(rule.resource_presets) ? rule.resource_presets.length : 0;
+      if (rule.media_only) count += 1;
+      if (rule.text_only) count += 1;
+      return count;
+    },
+    buildRuleSummary(rule) {
+      const targetCount = this.countRuleTargets(rule);
+      const botTargetCount = this.countRuleBotTargets(rule);
+      const filterCount = this.countRuleFilters(rule);
+      return [
+        rule.source_chat || "未设置源",
+        `账号目标 ${targetCount}`,
+        `Bot 目标 ${botTargetCount}`,
+        this.getRuleForwardStrategyLabel(rule.forward_strategy || "inherit"),
+        `过滤 ${filterCount}`,
+      ].join(" · ");
+    },
+    addRule() {
+      const index = this.config.rules.length;
+      this.config.rules.push(createRule(this.nextRuleName()));
+      this.expandRule(index);
+    },
+    duplicateRule(index) {
+      const sourceRule = this.config.rules[index];
+      const clonedRule = this.normalizeRule(
+        {
+          ...sourceRule,
+          name: this.buildCopyName(sourceRule.name),
+        },
+        index + 1,
+      );
+      this.config.rules.splice(index + 1, 0, clonedRule);
+      this.expandRule(index + 1);
+    },
+    removeRule(index) {
+      if (this.config.rules.length === 1) {
+        this.config.rules = [createRule("rule_1")];
+        this.ui.expandedRuleIndex = 0;
+        return;
+      }
+      this.config.rules.splice(index, 1);
+      if (this.ui.expandedRuleIndex >= this.config.rules.length) {
+        this.ui.expandedRuleIndex = this.config.rules.length - 1;
+      }
+    },
+    resetTelegramLogin(options = {}) {
+      const preservePhone = Boolean(options.preservePhone);
+      const phone = preservePhone ? this.telegramLogin.phone : "";
+      this.telegramLogin = {
+        ...createTelegramLoginState(),
+        phone,
+      };
+    },
+    async fetchJson(url, options = {}) {
+      const mergedHeaders = {
+        "Content-Type": "application/json",
+        ...this.authHeaders(),
+        ...(options.headers || {}),
+      };
+      const response = await fetch(url, {
+        ...options,
+        headers: mergedHeaders,
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(this.formatApiError(payload));
+      }
+      return payload;
+    },
+    async login() {
+      this.authBusy = true;
+      this.error = "";
+      this.notice = "";
+      try {
+        await this.fetchJson("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ password: this.passwordInput }),
+        });
+        this.authed = true;
+        localStorage.setItem("tg_dashboard_password", this.passwordInput);
+        this.notice = "登录成功。";
+        await this.bootstrap();
+        this.startPolling();
+      } catch (err) {
+        this.authed = false;
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.authBusy = false;
+      }
+    },
+    logout() {
+      this.authed = false;
+      this.notice = "";
+      this.error = "";
+      this.validation = null;
+      this.logs = [];
+      this.defaultStartupNotifyMessage = "";
+      this.config = createConfig();
+      this.search = createSearchState();
+      this.telegramLogin = createTelegramLoginState();
+      this.status = {
+        status: "stopped",
+        config_path: "",
+        last_error: null,
+        snapshot: null,
+      };
+      this.queue = {
+        failedItems: [],
+        actionBusy: false,
+        successHistoryTotalCount: 0,
+        successHistoryRules: [],
+        successHistoryRuleName: "",
+      };
+      this.ui.showLogBottom = false;
+      localStorage.removeItem("tg_dashboard_password");
+      this.stopPolling();
+    },
+    async bootstrap() {
+      this.loading = true;
+      try {
+        await Promise.all([
+          this.fetchConfig(),
+          this.fetchStatus(),
+          this.fetchLogs(),
+          this.fetchFailedQueue({ silent: true }),
+          this.fetchSuccessHistorySummary({ silent: true }),
+        ]);
+      } finally {
+        this.loading = false;
+      }
+    },
+    startPolling() {
+      this.stopPolling();
+      this.timers.push(setInterval(() => this.fetchStatus({ silent: true }), 1000));
+      this.timers.push(setInterval(() => this.fetchLogs({ silent: true }), 1200));
+      this.timers.push(setInterval(() => this.fetchFailedQueue({ silent: true }), 3000));
+      this.timers.push(setInterval(() => this.fetchSuccessHistorySummary({ silent: true }), 4000));
+    },
+    stopPolling() {
+      this.timers.forEach((timerId) => clearInterval(timerId));
+      this.timers = [];
+    },
+    async fetchConfig() {
+      try {
+        const response = await this.fetchJson("/api/config");
+        this.defaultStartupNotifyMessage = String(response.data.defaultStartupNotifyMessage || "");
+        this.config = this.normalizeConfig(response.data.config);
+        this.configPath = response.data.configPath;
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      }
+    },
+    async fetchStatus(options = {}) {
+      const silent = Boolean(options.silent);
+      try {
+        const response = await this.fetchJson("/api/status");
+        this.status = response.data;
+      } catch (err) {
+        if (!silent) {
+          this.error = this.normalizeCaughtError(err);
+        }
+      }
+    },
+    async fetchLogs(options = {}) {
+      const silent = Boolean(options.silent);
+      try {
+        const response = await this.fetchJson("/api/logs?limit=220");
+        this.logs = response.data.items || [];
+        this.$nextTick(() => this.syncLogBoxState());
+      } catch (err) {
+        if (!silent) {
+          this.error = this.normalizeCaughtError(err);
+        }
+      }
+    },
+    async fetchFailedQueue(options = {}) {
+      const silent = Boolean(options.silent);
+      try {
+        const response = await this.fetchJson("/api/queue/failed?limit=20");
+        this.queue.failedItems = response.data.items || [];
+      } catch (err) {
+        if (!silent) {
+          this.error = this.normalizeCaughtError(err);
+        }
+      }
+    },
+    async fetchSuccessHistorySummary(options = {}) {
+      const silent = Boolean(options.silent);
+      try {
+        const response = await this.fetchJson("/api/queue/success-history/summary");
+        this.queue.successHistoryTotalCount = Number(response.data.total_count || 0);
+        this.queue.successHistoryRules = response.data.rules || [];
+        if (
+          this.queue.successHistoryRuleName &&
+          !this.queue.successHistoryRules.some(
+            (item) => item.rule_name === this.queue.successHistoryRuleName,
+          )
+        ) {
+          this.queue.successHistoryRuleName = "";
+        }
+      } catch (err) {
+        if (!silent) {
+          this.error = this.normalizeCaughtError(err);
+        }
+      }
+    },
+    async saveConfig(options = {}) {
+      const successMessage = options.successMessage || "";
+      const throwOnError = Boolean(options.throwOnError);
+      this.saving = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        this.config.rate_limit_delay_seconds = this.normalizeRateLimitDelayInput(
+          this.config.rate_limit_delay_seconds,
+        );
+        const payload = {
+          ...this.config,
+          startup_notify_message: this.serializeStartupNotifyMessage(
+            this.config.startup_notify_message,
+          ),
+        };
+        const response = await this.fetchJson("/api/config", {
+          method: "PUT",
+          body: JSON.stringify(payload),
+        });
+        this.notice = successMessage || response.message;
+        await this.fetchConfig();
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+        if (throwOnError) {
+          throw err;
+        }
+      } finally {
+        this.saving = false;
+      }
+    },
+    async validateConfig() {
+      this.validating = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/validate", { method: "POST" });
+        this.validation = response.data;
+        this.notice = response.message;
+        this.ui.activeTab = "status";
+      } catch (err) {
+        this.validation = null;
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.validating = false;
+      }
+    },
+    async runAction(action) {
+      this.actionBusy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson(`/api/${action}`, { method: "POST" });
+        this.status = response.data;
+        this.notice = response.message;
+        await this.fetchStatus({ silent: true });
+        await this.fetchLogs({ silent: true });
+        await this.fetchFailedQueue({ silent: true });
+        await this.fetchSuccessHistorySummary({ silent: true });
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.actionBusy = false;
+      }
+    },
+    async runQueueAction(action, payload = null) {
+      this.queue.actionBusy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson(`/api/queue/${action}`, {
+          method: "POST",
+          body: payload == null ? null : JSON.stringify(payload),
+        });
+        this.notice = response.message;
+        await Promise.all([
+          this.fetchStatus({ silent: true }),
+          this.fetchLogs({ silent: true }),
+          this.fetchFailedQueue({ silent: true }),
+          this.fetchSuccessHistorySummary({ silent: true }),
+        ]);
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.queue.actionBusy = false;
+      }
+    },
+    async startService() {
+      await this.runAction("start");
+    },
+    async stopService() {
+      await this.runAction("stop");
+    },
+    async restartService() {
+      await this.runAction("restart");
+    },
+    async retryFailedQueue() {
+      await this.runQueueAction("retry-failed");
+    },
+    async clearFailedQueue() {
+      await this.runQueueAction("clear-failed");
+    },
+    async clearAllSuccessHistory() {
+      if (!this.queue.successHistoryTotalCount) {
+        return;
+      }
+      const confirmed = window.confirm(
+        "清空全部已转发历史后，以后重启或重新命中时，这些历史消息可能再次进入转发判断。确定继续吗？",
+      );
+      if (!confirmed) {
+        return;
+      }
+      await this.runQueueAction("clear-success-history", { rule_name: "" });
+    },
+    async clearSelectedSuccessHistory() {
+      const ruleName = String(this.queue.successHistoryRuleName || "").trim();
+      if (!ruleName) {
+        this.error = "请先选择一条规则。";
+        return;
+      }
+      const confirmed = window.confirm(
+        `确定清空规则“${ruleName}”的已转发历史吗？清空后这条规则以后可能再次处理旧消息。`,
+      );
+      if (!confirmed) {
+        return;
+      }
+      await this.runQueueAction("clear-success-history", { rule_name: ruleName });
+    },
+    async requestTelegramCode() {
+      this.telegramLogin.busy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        if (this.telegramLogin.loginId) {
+          await this.fetchJson("/api/session/cancel", {
+            method: "POST",
+            body: JSON.stringify({ login_id: this.telegramLogin.loginId }),
+          });
+        }
+        const response = await this.fetchJson("/api/session/request-code", {
+          method: "POST",
+          body: JSON.stringify({
+            api_id: this.config.api_id,
+            api_hash: this.config.api_hash,
+            phone: this.telegramLogin.phone,
+            proxy_type: this.config.proxy_type,
+            proxy_host: this.config.proxy_host,
+            proxy_port: this.config.proxy_port,
+            proxy_user: this.config.proxy_user,
+            proxy_password: this.config.proxy_password,
+            proxy_rdns: this.config.proxy_rdns,
+          }),
+        });
+        this.telegramLogin = {
+          ...this.telegramLogin,
+          code: "",
+          password: "",
+          loginId: response.data.login_id || "",
+          step: "code",
+        };
+        this.notice = response.message;
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.telegramLogin.busy = false;
+      }
+    },
+    async completeTelegramLogin() {
+      if (!this.telegramLogin.loginId) {
+        this.error = "请先发送验证码。";
+        return;
+      }
+      this.telegramLogin.busy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/session/complete", {
+          method: "POST",
+          body: JSON.stringify({
+            login_id: this.telegramLogin.loginId,
+            code: this.telegramLogin.code,
+            password: this.telegramLogin.password,
+          }),
+        });
+        if (response.data.status === "password_required") {
+          this.telegramLogin = {
+            ...this.telegramLogin,
+            code: "",
+            password: "",
+            step: "password",
+          };
+          this.notice = response.message;
+          return;
+        }
+
+        this.config.session_string = response.data.session_string || "";
+        this.ui.showSessionString = false;
+        this.resetTelegramLogin({ preservePhone: true });
+        try {
+          await this.saveConfig({
+            successMessage: "Telegram 登录成功，session_string 已自动保存到 .env。",
+            throwOnError: true,
+          });
+        } catch (_err) {
+          this.notice = "Telegram 登录成功，但自动保存失败了，请点一次“保存配置”。";
+        }
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.telegramLogin.busy = false;
+      }
+    },
+    async cancelTelegramLogin() {
+      const previousPhone = this.telegramLogin.phone;
+      this.telegramLogin.busy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        await this.fetchJson("/api/session/cancel", {
+          method: "POST",
+          body: JSON.stringify({ login_id: this.telegramLogin.loginId }),
+        });
+        this.notice = "已取消当前网页登录流程。";
+        this.resetTelegramLogin({ preservePhone: true });
+        this.telegramLogin.phone = previousPhone;
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.telegramLogin.busy = false;
+      }
+    },
+    async searchMessages() {
+      this.notice = "";
+      this.error = "";
+      const query = this.normalizeSearchQuery(this.search.query);
+      if (!query) {
+        this.search.results = [];
+        this.search.sourceFilter = "all";
+        this.error = "搜索关键词不能为空，请先输入你要找的内容。";
+        return;
+      }
+      this.search.loading = true;
+      try {
+        const response = await this.fetchJson("/api/search", {
+          method: "POST",
+          body: JSON.stringify({
+            query,
+            limit: Number(this.search.limit) || 20,
+          }),
+        });
+        this.search.results = (response.data.items || []).map((item) => this.normalizeSearchResult(item));
+        this.syncSearchSourceFilter();
+        this.notice = response.message;
+        this.ui.activeTab = "search";
+      } catch (err) {
+        this.search.results = [];
+        this.search.sourceFilter = "all";
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.search.loading = false;
+      }
+    },
+    async forwardSearchResult(result) {
+      if (!this.hasForwardTargets(result)) {
+        this.error = "这条搜索结果没有已配置的默认目标，先去规则里补上目标频道。";
+        return;
+      }
+      const key = this.resultKey(result);
+      this.search.forwardingKey = key;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/forward/manual", {
+          method: "POST",
+          body: JSON.stringify({
+            source_chat: result.source_chat,
+            message_id: result.message_id,
+            target_chats: result.default_target_chats || "",
+            bot_target_chats: result.default_bot_target_chats || "",
+            forward_strategy: result.default_forward_strategy || "",
+          }),
+        });
+        const accountCount = Array.isArray(response.data?.account_targets) ? response.data.account_targets.length : 0;
+        const botCount = Array.isArray(response.data?.bot_targets) ? response.data.bot_targets.length : 0;
+        const summary = [];
+        if (accountCount) {
+          summary.push(`账号目标 ${accountCount} 个`);
+        }
+        if (botCount) {
+          summary.push(`Bot 目标 ${botCount} 个`);
+        }
+        this.notice = summary.length ? `${response.message} ${summary.join("，")}。` : response.message;
+        this.notice = this.buildManualForwardNotice(response);
+        this.error = "";
+        await this.fetchLogs({ silent: true });
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.search.forwardingKey = "";
+      }
+    },
+  },
+  template: `
+    <main class="shell">
+      <section v-if="!authed" class="login-shell">
+        <div class="login-card">
+          <p class="eyebrow">TG 转发控制台</p>
+          <h1>输入控制台密码</h1>
+          <p class="hero-text">
+            默认密码是 admin。登录后可以配置实时转发规则，也可以搜索历史消息后做指定转发。
+          </p>
+          <label class="login-label">
+            <span>控制台密码</span>
+            <input
+              v-model="passwordInput"
+              type="password"
+              placeholder="请输入密码"
+              @keyup.enter="login"
+            />
+          </label>
+          <div class="toolbar">
+            <button class="btn btn-primary" :disabled="authBusy" @click="login">
+              {{ authBusy ? '登录中...' : '进入控制台' }}
+            </button>
+          </div>
+          <section v-if="error" class="banner banner-error">{{ error }}</section>
+        </div>
+      </section>
+
+      <template v-else>
+        <section class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow">TG 转发控制台</p>
+            <h1>多端更顺手的设置面板</h1>
+            <p class="hero-text">
+              把长页面拆成几个清晰区域：基础配置、规则、搜索、状态、日志。手机上更容易点，桌面上也更容易看全局状态。
+            </p>
+            <div class="stat-strip">
+              <div class="stat-chip">
+                <strong>{{ ruleCount }}</strong>
+                <span>规则总数</span>
+              </div>
+              <div class="stat-chip">
+                <strong>{{ enabledRuleCount }}</strong>
+                <span>已启用</span>
+              </div>
+              <div class="stat-chip">
+                <strong>{{ runningWorkerCount }}</strong>
+                <span>运行中</span>
+              </div>
+            </div>
+          </div>
+          <div class="hero-side">
+            <div class="status-card">
+              <span class="status-label">当前状态</span>
+              <strong class="status-pill" :data-tone="statusTone">{{ statusText }}</strong>
+              <p class="status-path">{{ status.config_path || configPath || '尚未加载配置文件' }}</p>
+              <p v-if="status.last_error" class="status-error">{{ status.last_error }}</p>
+              <p v-if="status.snapshot" class="status-meta">{{ statusRateLimitText }}</p>
+              <p v-if="status.snapshot" class="status-meta">
+                {{ '\u5f53\u524d\u961f\u5217\uff1a' + statusGlobalQueueDepth + ' \u6761\uff08\u542b\u53d1\u9001\u4e2d\uff09\uff0c\u5931\u8d25 ' + statusGlobalQueueFailed + ' \u6761' }}
+              </p>
+              <div class="toolbar compact-toolbar">
+                <button class="btn btn-ghost" @click="logout">退出登录</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="action-bar">
+          <div class="action-bar-inner">
+            <button class="btn btn-primary" :disabled="saving" @click="saveConfig">
+              <span class="btn-label-full">{{ saving ? '保存中...' : '保存配置' }}</span>
+              <span class="btn-label-short">{{ saving ? '保存中' : '保存' }}</span>
+            </button>
+            <button class="btn btn-secondary" :disabled="validating" @click="validateConfig">
+              <span class="btn-label-full">{{ validating ? '校验中...' : '校验配置' }}</span>
+              <span class="btn-label-short">{{ validating ? '校验中' : '校验' }}</span>
+            </button>
+            <button class="btn btn-accent" :disabled="actionBusy" @click="startService">
+              <span class="btn-label-full">{{ actionBusy ? '处理中...' : '启动后端' }}</span>
+              <span class="btn-label-short">{{ actionBusy ? '处理中' : '启动' }}</span>
+            </button>
+            <button class="btn btn-ghost" :disabled="actionBusy" @click="restartService">
+              <span class="btn-label-full">重启后端</span>
+              <span class="btn-label-short">重启</span>
+            </button>
+            <button class="btn btn-danger" :disabled="actionBusy" @click="stopService">
+              <span class="btn-label-full">停止后端</span>
+              <span class="btn-label-short">停止</span>
+            </button>
+          </div>
+        </section>
+
+        <nav class="tab-nav" aria-label="页面分区">
+          <button
+            v-for="tab in tabItems"
+            :key="tab.key"
+            class="tab-pill"
+            :data-active="ui.activeTab === tab.key"
+            @click="setActiveTab(tab.key)"
+          >
+            {{ tab.label }}
+          </button>
+        </nav>
+
+        <section v-if="notice" class="banner banner-ok">{{ notice }}</section>
+        <section v-if="error" class="banner banner-error">{{ error }}</section>
+
+        <section class="content-stack">
+          <article v-show="ui.activeTab === 'config'" class="panel">
+            <div class="panel-head">
+              <div>
+                <h2>基础配置</h2>
+                <p class="panel-subtext">这些字段是所有规则共用的基础账号配置。保存后会写入 .env。</p>
+              </div>
+              <span class="panel-meta">{{ configPath || '.env' }}</span>
+            </div>
+            <div class="form-grid">
+              <label>
+                <span>API ID</span>
+                <input v-model="config.api_id" placeholder="123456" />
+              </label>
+              <label>
+                <span>API HASH</span>
+                <input v-model="config.api_hash" placeholder="your_api_hash" />
+              </label>
+            </div>
+
+            <div class="subpanel login-flow-panel">
+              <div class="panel-head compact-head panel-head-wrap">
+                <div>
+                  <h3>网页登录 Telegram</h3>
+                  <p class="panel-subtext">
+                    首次登录不用再回终端执行命令。填手机号，收验证码，在这里完成登录，成功后会自动保存到 .env。
+                  </p>
+                </div>
+                <span class="mini-pill" :data-tone="hasSessionString ? 'good' : 'muted'">
+                  {{ hasSessionString ? '已保存 session' : '未登录' }}
+                </span>
+              </div>
+              <p class="flow-hint">
+                <template v-if="telegramLogin.step === 'idle'">
+                  先填写手机号，然后点“发送验证码”。
+                </template>
+                <template v-else-if="telegramLogin.step === 'code'">
+                  验证码已发送到 {{ telegramLogin.phone }}，直接在这里输入即可。
+                </template>
+                <template v-else-if="telegramLogin.step === 'password'">
+                  这个账号开启了二步验证，请继续输入二步验证密码。
+                </template>
+              </p>
+              <div class="login-flow-grid">
+                <label>
+                  <span>手机号</span>
+                  <input
+                    v-model="telegramLogin.phone"
+                    inputmode="tel"
+                    placeholder="+8613800000000"
+                    @keyup.enter="requestTelegramCode"
+                  />
+                </label>
+                <label v-if="telegramLogin.step === 'code'">
+                  <span>验证码</span>
+                  <input
+                    v-model="telegramLogin.code"
+                    inputmode="numeric"
+                    placeholder="输入 Telegram 验证码"
+                    @keyup.enter="completeTelegramLogin"
+                  />
+                </label>
+                <label v-if="telegramLogin.step === 'password'">
+                  <span>二步验证密码</span>
+                  <input
+                    v-model="telegramLogin.password"
+                    type="password"
+                    placeholder="输入二步验证密码"
+                    @keyup.enter="completeTelegramLogin"
+                  />
+                </label>
+              </div>
+              <div class="toolbar compact-toolbar">
+                <button class="btn btn-secondary btn-small" :disabled="telegramLogin.busy" @click="requestTelegramCode">
+                  {{ telegramLogin.busy && telegramLogin.step === 'idle' ? '发送中...' : (telegramLogin.loginId ? '重新发送验证码' : '发送验证码') }}
+                </button>
+                <button
+                  v-if="telegramLogin.step === 'code' || telegramLogin.step === 'password'"
+                  class="btn btn-primary btn-small"
+                  :disabled="telegramLogin.busy"
+                  @click="completeTelegramLogin"
+                >
+                  {{ telegramLogin.busy ? '提交中...' : (telegramLogin.step === 'password' ? '提交密码' : '完成登录') }}
+                </button>
+                <button
+                  v-if="telegramLogin.loginId"
+                  class="btn btn-ghost btn-small"
+                  :disabled="telegramLogin.busy"
+                  @click="cancelTelegramLogin"
+                >
+                  取消本次登录
+                </button>
+              </div>
+            </div>
+
+            <div class="form-grid">
+              <label class="span-2">
+                <span>SESSION STRING</span>
+                <textarea
+                  v-if="ui.showSessionString"
+                  v-model="config.session_string"
+                  rows="4"
+                  placeholder="网页登录成功后会自动写入这里，也可以手动粘贴已有 session_string"
+                ></textarea>
+                <textarea
+                  v-else
+                  :value="hasSessionString ? '已保存 session_string。点击下方按钮可查看、替换或清空。' : ''"
+                  rows="2"
+                  placeholder="网页登录成功后会自动写入这里，也可以手动粘贴已有 session_string"
+                  readonly
+                ></textarea>
+              </label>
+              <div class="inline-actions span-2">
+                <button class="inline-toggle" @click="ui.showSessionString = !ui.showSessionString">
+                  {{ ui.showSessionString ? '隐藏 session_string' : '显示 / 编辑 session_string' }}
+                </button>
+                <button v-if="hasSessionString" class="inline-toggle" @click="config.session_string = ''">
+                  清空 session_string
+                </button>
+              </div>
+              <label class="span-2">
+                <span>BOT TOKEN</span>
+                <input
+                  v-model="config.bot_token"
+                  :type="ui.showBotToken ? 'text' : 'password'"
+                  title="支持多个 Bot Token，多个请用英文逗号分隔"
+                  placeholder="可选：填写 1 个或多个 Telegram Bot Token，多个请用英文逗号分隔"
+                />
+              </label>
+              <div class="inline-actions span-2">
+                <button class="inline-toggle" @click="ui.showBotToken = !ui.showBotToken">
+                  {{ ui.showBotToken ? '隐藏 Bot Token' : '显示 Bot Token' }}
+                </button>
+              </div>
+              <p class="panel-subtext span-2">
+                {{ "\u652f\u6301\u591a\u4e2a Bot Token\uff0c\u8bf7\u7528\u82f1\u6587\u9017\u53f7\u5206\u9694\uff0c\u4f8b\u5982\uff1atoken_1,token_2,token_3\u3002\u5f53\u8f6c\u53d1\u7b56\u7565\u9009\u62e9\u201c\u4f18\u5148 Bot\uff08\u5931\u8d25\u540e\u518d\u8bd5\u8d26\u53f7\uff09\u201d\u65f6\uff0c\u7cfb\u7edf\u4f1a\u6309\u987a\u5e8f\u5c1d\u8bd5 bot#1 -> bot#2 -> bot#3\uff0c\u5168\u90e8 Bot \u5931\u8d25\u540e\u518d\u56de\u9000\u5230\u767b\u5f55\u8d26\u53f7\u3002" }}
+              </p>
+              <label class="span-2">
+                <span>{{ "\u8f6c\u53d1\u7b56\u7565" }}</span>
+                <select v-model="config.forward_strategy">
+                  <option
+                    v-for="item in forwardStrategyOptions"
+                    :key="item.value"
+                    :value="item.value"
+                  >
+                    {{ item.label }}
+                  </option>
+                </select>
+              </label>
+              <p class="panel-subtext span-2">
+                {{ forwardStrategyHelpText }}
+              </p>
+              <label class="toggle span-2">
+                <input type="checkbox" v-model="config.rate_limit_protection" />
+                <span>启用全局排队限流，多个规则同时命中时也会进入同一个发送队列，一个一个按顺序发，降低触发 Telegram 限制的概率</span>
+              </label>
+              <label class="span-2">
+                <span>全局发送间隔（秒）</span>
+                <input
+                  v-model.number="config.rate_limit_delay_seconds"
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  placeholder="1.2"
+                />
+              </label>
+              <p class="panel-subtext span-2">
+                {{ '\u5f00\u542f\u5168\u5c40\u6392\u961f\u9650\u6d41\u540e\u751f\u6548\uff0c\u6240\u6709\u89c4\u5219\u4f1a\u5171\u7528\u8fd9\u4e00\u5957\u7b49\u5f85\u95f4\u9694\u3002\u5f53\u524d\u8bbe\u7f6e\uff1a' + formatSeconds(config.rate_limit_delay_seconds) }}
+              </p>
+              <label class="toggle span-2">
+                <input type="checkbox" v-model="config.startup_notify_enabled" />
+                <span>启动或重启后，自动向已配置的目标群发送一条“启动成功”通知</span>
+              </label>
+              <p class="panel-subtext span-2">
+                下方已经自动填入系统默认启动通知内容，你可以直接修改；如果保持默认文案，保存时仍会按“系统默认”处理。
+              </p>
+              <label class="span-2">
+                <span>启动通知内容</span>
+                <textarea
+                  v-model="config.startup_notify_message"
+                  rows="7"
+                  placeholder="直接填写启动通知内容。支持 HTML，例如 &lt;b&gt;加粗&lt;/b&gt;、&lt;a href='https://example.com'&gt;链接&lt;/a&gt;。"
+                ></textarea>
+              </label>
+            </div>
+
+            <div class="subpanel">
+              <div class="panel-head compact-head">
+                <div>
+                  <h3>代理设置</h3>
+                  <p class="panel-subtext">没有代理就留空。</p>
+                </div>
+              </div>
+              <div class="form-grid">
+                <label>
+                  <span>代理类型</span>
+                  <input v-model="config.proxy_type" placeholder="socks5" />
+                </label>
+                <label>
+                  <span>代理地址</span>
+                  <input v-model="config.proxy_host" placeholder="127.0.0.1" />
+                </label>
+                <label>
+                  <span>代理端口</span>
+                  <input v-model="config.proxy_port" placeholder="7890" />
+                </label>
+                <label>
+                  <span>代理用户名</span>
+                  <input v-model="config.proxy_user" placeholder="可留空" />
+                </label>
+                <label>
+                  <span>代理密码</span>
+                  <input v-model="config.proxy_password" placeholder="可留空" />
+                </label>
+                <label class="toggle">
+                  <input type="checkbox" v-model="config.proxy_rdns" />
+                  <span>启用 RDNS</span>
+                </label>
+              </div>
+            </div>
+
+          </article>
+
+          <article v-show="ui.activeTab === 'rules'" class="panel">
+            <div class="panel-head panel-head-wrap">
+              <div>
+                <h2>规则设置</h2>
+                <p class="panel-subtext">每条规则只监听一个源。点击卡片头可以展开或收起详细配置，手机上会轻松很多。</p>
+              </div>
+              <button class="btn btn-primary btn-small" @click="addRule">新增规则</button>
+            </div>
+
+            <div class="rule-stack">
+              <article
+                v-for="(rule, index) in config.rules"
+                :key="index"
+                class="rule-card"
+                :data-open="isRuleExpanded(index)"
+              >
+                <button class="rule-overview" @click="toggleRule(index)">
+                  <div class="rule-overview-main">
+                    <div class="rule-title-row">
+                      <strong>{{ rule.name || ('rule_' + (index + 1)) }}</strong>
+                      <span class="mini-pill" :data-tone="rule.enabled ? 'good' : 'muted'">
+                        {{ rule.enabled ? '已启用' : '已停用' }}
+                      </span>
+                    </div>
+                    <p class="rule-summary">{{ buildRuleSummary(rule) }}</p>
+                  </div>
+                  <span class="expand-mark">{{ isRuleExpanded(index) ? '收起' : '展开' }}</span>
+                </button>
+
+                <div v-show="isRuleExpanded(index)" class="rule-body">
+                  <div class="rule-actions">
+                    <button class="btn btn-ghost btn-small" @click="duplicateRule(index)">复制</button>
+                    <button class="btn btn-ghost btn-small" @click="removeRule(index)">删除</button>
+                  </div>
+
+                  <div class="form-grid rule-grid">
+                    <label>
+                      <span>规则名称</span>
+                      <input v-model="rule.name" placeholder="news_to_main" />
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" v-model="rule.enabled" />
+                      <span>启用这条规则</span>
+                    </label>
+                    <label>
+                      <span>源频道 / 群</span>
+                      <input v-model="rule.source_chat" placeholder="@source_channel" />
+                    </label>
+                    <label>
+                      <span>账号目标频道 / 群</span>
+                      <input v-model="rule.target_chats" placeholder="@target_1,@target_2" />
+                    </label>
+                    <label>
+                      <span>Bot 目标频道 / 群</span>
+                      <input v-model="rule.bot_target_chats" placeholder="@bot_target 或 chat_id" />
+                    </label>
+                    <label class="span-2">
+                      <span>发送身份 / 转发策略</span>
+                      <select v-model="rule.forward_strategy">
+                        <option
+                          v-for="item in ruleForwardStrategyOptions"
+                          :key="item.value"
+                          :value="item.value"
+                        >
+                          {{ item.label }}
+                        </option>
+                      </select>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      {{ getRuleForwardStrategyHelpText(rule.forward_strategy) }}
+                    </p>
+                    <label class="toggle">
+                      <input type="checkbox" v-model="rule.include_edits" />
+                      <span>监听编辑后的消息</span>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" v-model="rule.forward_own_messages" />
+                      <span>转发自己发送的消息（测试用）</span>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      {{ "\u5f00\u542f\u540e\uff0c\u5f53\u524d\u767b\u5f55\u8d26\u53f7\u5728\u6e90\u9891\u9053/\u7fa4\u81ea\u5df1\u53d1\u7684\u6d88\u606f\u4e5f\u4f1a\u53c2\u4e0e\u5b9e\u65f6\u8f6c\u53d1\uff0c\u65b9\u4fbf\u4f60\u6d4b\u8bd5\u3002\u5982\u679c\u6e90\u548c\u76ee\u6807\u914d\u7f6e\u6210\u4e86\u540c\u4e00\u4e2a\u5730\u65b9\uff0c\u8bf7\u8c28\u614e\u5f00\u542f\uff0c\u907f\u514d\u5faa\u73af\u8f6c\u53d1\u3002" }}
+                    </p>
+                    <label class="span-2">
+                      <span>命中任一关键词才转发</span>
+                      <textarea v-model="rule.keywords_any" rows="3" placeholder="ed2k://,115cdn.com,magnet:"></textarea>
+                    </label>
+                    <label class="span-2">
+                      <span>必须全部命中</span>
+                      <textarea v-model="rule.keywords_all" rows="3" placeholder="例如：115cdn.com&#10;4K"></textarea>
+                    </label>
+                    <label class="span-2">
+                      <span>黑名单关键词</span>
+                      <textarea v-model="rule.block_keywords" rows="3" placeholder="广告,spam"></textarea>
+                    </label>
+                    <div class="span-2 preset-grid">
+                      <div class="preset-grid-head">
+                        <span>资源类型快捷识别</span>
+                        <p class="panel-subtext">直接勾选要识别的资源类型，不用手填关键词。</p>
+                      </div>
+                      <label
+                        v-for="preset in resourcePresetOptions"
+                        :key="preset.value"
+                        class="toggle preset-toggle"
+                      >
+                        <input
+                          :value="preset.value"
+                          v-model="rule.resource_presets"
+                          type="checkbox"
+                        />
+                        <span>{{ preset.label }}</span>
+                      </label>
+                    </div>
+                    <label class="span-2">
+                      <span>自定义正则：命中任一才转发</span>
+                      <textarea
+                        v-model="rule.regex_any"
+                        rows="3"
+                        placeholder="一行一个正则，例如：&#10;ed2k://\\|file\\|&#10;magnet:\\?xt=&#10;https?://(?:www\\.)?115cdn\\.com/"
+                      ></textarea>
+                    </label>
+                    <label class="span-2">
+                      <span>自定义正则：必须全部命中</span>
+                      <textarea
+                        v-model="rule.regex_all"
+                        rows="3"
+                        placeholder="一行一个正则，例如：&#10;115cdn\\.com&#10;4K"
+                      ></textarea>
+                    </label>
+                    <label class="span-2">
+                      <span>自定义正则：黑名单</span>
+                      <textarea
+                        v-model="rule.regex_block"
+                        rows="3"
+                        placeholder="一行一个正则，例如：&#10;广告&#10;(?i)spam"
+                      ></textarea>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      {{ "匹配会同时检查正文、caption、按钮文字、按钮跳转链接，以及消息里直接带出的链接文本。你可以三种方式控制：1. 普通关键词；2. 直接勾选资源类型；3. 填自定义正则。如果同时填了“必须全部命中”和“命中任一才转发”，系统会先检查“全部条件”，满足就转发；否则再检查“任一条件”。黑名单关键词和黑名单正则始终优先级最高。" }}
+                    </p>
+                    <label class="toggle">
+                      <input type="checkbox" v-model="rule.media_only" />
+                      <span>需要媒体</span>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" v-model="rule.text_only" />
+                      <span>需要文本内容</span>
+                    </label>
+                    <label v-if="rule.media_only && rule.text_only" class="span-2">
+                      <span>媒体 / 文本关系</span>
+                      <select v-model="rule.content_match_mode">
+                        <option value="all">同时满足</option>
+                        <option value="any">任一满足</option>
+                      </select>
+                    </label>
+                    <label class="toggle">
+                      <input type="checkbox" v-model="rule.case_sensitive" />
+                      <span>关键词区分大小写</span>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      {{ "\u53ef\u4ee5\u540c\u65f6\u52fe\u9009\u201c\u9700\u8981\u5a92\u4f53\u201d\u548c\u201c\u9700\u8981\u6587\u672c\u5185\u5bb9\u201d\u3002\u5982\u679c\u4e24\u4e2a\u90fd\u5f00\u542f\uff0c\u4f60\u53ef\u4ee5\u5728\u4e0a\u9762\u9009\u62e9\u201c\u540c\u65f6\u6ee1\u8db3\u201d\u6216\u201c\u4efb\u4e00\u6ee1\u8db3\u201d\u3002" }}
+                    </p>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </article>
+
+          <article v-show="ui.activeTab === 'search'" class="panel">
+            <div class="panel-head panel-head-wrap">
+              <div>
+                <h2>消息搜索</h2>
+                <p class="panel-subtext">从所有已配置的源频道里做关键词模糊搜索，只检查 Telegram 原消息本身。搜到后可以直接按规则里已配置的目标转发。</p>
+              </div>
+              <div class="search-toolbar">
+                <input
+                  v-model="search.query"
+                  class="search-input"
+                  placeholder="请输入关键词，例如 电影、更新、合集"
+                  @keyup.enter="canSearch ? searchMessages() : null"
+                />
+                <input
+                  v-model.number="search.limit"
+                  class="search-limit"
+                  type="number"
+                  min="1"
+                  max="100"
+                />
+                <button
+                  class="btn btn-secondary btn-small"
+                  :disabled="search.loading || !canSearch"
+                  @click="searchMessages"
+                >
+                  {{ search.loading ? '搜索中...' : (canSearch ? '搜索所有源' : '先输入关键词') }}
+                </button>
+              </div>
+              <p class="panel-subtext search-mode-note">搜索范围只包含消息正文、caption、按钮文字和消息里直接带的链接文本。</p>
+            </div>
+
+            <div v-if="search.results.length" class="search-layout">
+              <aside class="search-sidebar">
+                <div class="search-sidebar-card">
+                  <p class="eyebrow search-sidebar-eyebrow">频道切换</p>
+                  <strong class="search-sidebar-title">{{ activeSearchSourceOption.label }}</strong>
+                  <p class="search-sidebar-meta">当前显示 {{ searchVisibleCount }} / {{ search.results.length }} 条结果</p>
+                  <div class="search-source-list">
+                    <button
+                      v-for="item in searchSourceOptions"
+                      :key="item.key"
+                      class="search-source-btn"
+                      :data-active="search.sourceFilter === item.key"
+                      @click="search.sourceFilter = item.key"
+                    >
+                      <span class="search-source-btn-label">{{ item.label }}</span>
+                      <span class="search-source-btn-count">{{ item.count }}</span>
+                    </button>
+                  </div>
+                </div>
+              </aside>
+              <section class="search-results-panel">
+                <div class="search-results-head">
+                  <div>
+                    <strong class="search-results-title">{{ activeSearchSourceOption.label }}</strong>
+                    <p class="search-results-note">按时间从新到旧排列，点开结果后可直接按已配置目标转发。</p>
+                  </div>
+                  <span class="panel-meta">{{ searchVisibleCount }} 条</span>
+                </div>
+                <div v-if="filteredSearchResults.length" class="search-results-list">
+                  <article v-for="result in filteredSearchResults" :key="resultKey(result)" class="search-card">
+                    <div class="search-head">
+                    <div>
+                      <strong>{{ result.source_label }}</strong>
+                      <p class="search-meta">消息 ID：{{ result.message_id }}</p>
+                      <p class="search-meta">时间：{{ formatDateTime(result.date) || '未知' }}</p>
+                      <p class="search-meta">命中规则：{{ result.rules.join('、') || '无' }}</p>
+                    </div>
+                      <a v-if="result.link" class="text-link" :href="result.link" target="_blank" rel="noopener noreferrer">
+                        打开原消息
+                      </a>
+                    </div>
+                    <p class="search-preview">{{ result.preview }}</p>
+                    <div class="toolbar compact-toolbar">
+                      <button
+                        class="btn btn-accent btn-small"
+                        :disabled="search.forwardingKey === resultKey(result) || !hasForwardTargets(result)"
+                        @click="forwardSearchResult(result)"
+                      >
+                        {{ search.forwardingKey === resultKey(result) ? '转发中...' : '按已配置目标转发' }}
+                      </button>
+                      <span v-if="!hasForwardTargets(result)" class="search-tip">这条结果没有默认目标，先去规则里补目标频道。</span>
+                    </div>
+                  </article>
+                </div>
+                <div v-else class="empty-state">
+                  当前频道下还没有结果，切换到其他频道看看，或者重新搜索。
+                </div>
+              </section>
+            </div>
+            <div v-else class="empty-state">
+              还没有搜索结果。输入关键词后点“搜索所有源”，系统会做模糊匹配并按时间从新到旧展示。
+            </div>
+          </article>
+
+          <article v-show="ui.activeTab === 'status'" class="panel">
+            <div class="panel-grid panel-grid-tight">
+              <section class="subpanel">
+                <div class="panel-head">
+                  <div>
+                    <h2>发送队列</h2>
+                    <p class="panel-subtext">自动消息会先进入本地队列，再由 dispatcher 按策略发送。这样重启后能继续，失败目标也能单独重试。</p>
+                  </div>
+                  <span class="panel-meta">{{ statusGlobalQueueDepth }} 条队列任务</span>
+                </div>
+                <div class="worker-list queue-panel-stack">
+                  <div class="worker-card">
+                    <div class="worker-row">
+                      <strong>Dispatcher</strong>
+                      <span class="mini-pill" :data-tone="dispatcherAlive ? 'good' : 'bad'">
+                        {{ dispatcherAlive ? '运行中' : '未运行' }}
+                      </span>
+                    </div>
+                    <p>进程 PID：{{ dispatcherPid || '-' }}</p>
+                    <p>数据库：{{ statusQueueDbPath || '未提供' }}</p>
+                    <p>任务队列：{{ statusGlobalQueueDepth }} 条（待发送/发送中）</p>
+                    <p>失败任务：{{ statusGlobalQueueFailed }} 条</p>
+                    <p>目标队列：{{ statusGlobalQueueDeliveryDepth }} 个（待发送/发送中）</p>
+                    <p>失败目标：{{ statusGlobalQueueDeliveryFailed }} 个</p>
+                    <p>已转发去重历史：{{ queue.successHistoryTotalCount }} 条</p>
+                    <p>{{ statusRateLimitText }}</p>
+                    <div class="toolbar compact-toolbar">
+                      <button class="btn btn-secondary btn-small" :disabled="queue.actionBusy || !statusGlobalQueueFailed" @click="retryFailedQueue">
+                        {{ queue.actionBusy ? '处理中...' : '重试失败任务' }}
+                      </button>
+                      <button class="btn btn-ghost btn-small" :disabled="queue.actionBusy || !statusGlobalQueueFailed" @click="clearFailedQueue">
+                        清空失败任务
+                      </button>
+                    </div>
+                    <div class="toolbar compact-toolbar">
+                      <select
+                        v-model="queue.successHistoryRuleName"
+                        class="queue-history-select"
+                        :disabled="queue.actionBusy || !successHistoryRules.length"
+                      >
+                        <option value="">全部规则</option>
+                        <option
+                          v-for="item in successHistoryRules"
+                          :key="item.rule_name"
+                          :value="item.rule_name"
+                        >
+                          {{ item.rule_name }}（{{ item.count }}）
+                        </option>
+                      </select>
+                      <button
+                        class="btn btn-secondary btn-small"
+                        :disabled="queue.actionBusy || !queue.successHistoryRuleName || !selectedSuccessHistoryCount"
+                        @click="clearSelectedSuccessHistory"
+                      >
+                        清空当前规则历史
+                      </button>
+                      <button
+                        class="btn btn-ghost btn-small"
+                        :disabled="queue.actionBusy || !queue.successHistoryTotalCount"
+                        @click="clearAllSuccessHistory"
+                      >
+                        清空全部已转发历史
+                      </button>
+                    </div>
+                    <p v-if="queue.successHistoryRuleName">
+                      当前选中规则历史：{{ selectedSuccessHistoryCount }} 条
+                    </p>
+                    <div v-if="successHistoryRules.length" class="dispatch-history-list">
+                      <div
+                        v-for="item in successHistoryRules.slice(0, 8)"
+                        :key="item.rule_name"
+                        class="dispatch-history-card"
+                      >
+                        <div class="dispatch-history-head">
+                          <strong>{{ item.rule_name }}</strong>
+                          <span class="mini-pill" data-tone="good">{{ item.count }} 条</span>
+                        </div>
+                        <p class="dispatch-history-note">
+                          最近一次成功时间：{{ formatDateTime(item.last_completed_at) || '-' }}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="queue-history-grid">
+                    <div class="worker-card">
+                      <div class="worker-row">
+                        <strong>最近失败任务</strong>
+                        <span class="mini-pill" :data-tone="failedQueueItems.length ? 'bad' : 'good'">
+                          {{ failedQueueItems.length ? (failedQueueItems.length + ' 条') : '暂无失败' }}
+                        </span>
+                      </div>
+                      <div v-if="failedQueueItems.length" class="worker-list">
+                        <div v-for="item in failedQueueItems" :key="item.id" class="worker-card">
+                          <div class="worker-row">
+                            <strong>{{ item.rule_name }}</strong>
+                            <span class="mini-pill" data-tone="bad">失败 {{ item.failed_delivery_count }} 个目标</span>
+                          </div>
+                          <p>来源：{{ item.source_chat }}</p>
+                          <p>消息 ID：{{ item.message_id }}</p>
+                          <p>更新时间：{{ formatDateTime(item.updated_at) || '-' }}</p>
+                          <p>预览：{{ item.preview || '无文本内容' }}</p>
+                          <p>原因：{{ item.last_error || '未知错误' }}</p>
+                        </div>
+                      </div>
+                      <div v-else class="empty-state">
+                        当前没有待处理的失败任务。
+                      </div>
+                    </div>
+                    <div class="worker-card">
+                      <div class="worker-row">
+                        <strong>最近成功发送</strong>
+                        <span class="mini-pill" :data-tone="recentSuccessfulDispatches.length ? 'good' : 'muted'">
+                          {{ recentSuccessfulDispatches.length ? (recentSuccessfulDispatches.length + ' 条') : '暂无记录' }}
+                        </span>
+                      </div>
+                      <div v-if="recentSuccessfulDispatches.length" class="dispatch-history-list">
+                        <div
+                          v-for="item in recentSuccessfulDispatches"
+                          :key="String(item.sequence || item.created_at) + ':' + String(item.target || item.messageId)"
+                          class="dispatch-history-card"
+                        >
+                          <div class="dispatch-history-head">
+                            <strong>{{ item.target || '未识别目标' }}</strong>
+                            <div class="dispatch-history-badges">
+                              <span class="mini-pill" :data-tone="item.channelTone">{{ item.channelLabel }}</span>
+                              <span class="mini-pill" :data-tone="item.modeTone">{{ item.mode || '未知模式' }}</span>
+                            </div>
+                          </div>
+                          <p class="dispatch-history-meta">
+                            来源：{{ item.source || '未知来源' }} · 规则：{{ item.ruleName || '未标记规则' }}
+                          </p>
+                          <p class="dispatch-history-meta">
+                            消息 ID：{{ item.messageId || '-' }} · 类型：{{ item.messageType || '未知' }} · 时间：{{ formatDateTime(item.created_at) || '-' }}
+                          </p>
+                          <p class="dispatch-history-preview">{{ item.preview || '无文本内容' }}</p>
+                          <p v-if="item.note" class="dispatch-history-note">{{ item.note }}</p>
+                        </div>
+                      </div>
+                      <div v-else class="empty-state">
+                        最近还没有新的成功发送记录。
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </section>
+              <section class="subpanel">
+                <div class="panel-head">
+                  <div>
+                    <h2>运行状态</h2>
+                    <p class="panel-subtext">这里显示当前已经启动的 worker 进程。连续异常退出过多时会自动暂停，避免反复重启刷日志。</p>
+                  </div>
+                  <span class="panel-meta">{{ workerCards.length }} 个 worker</span>
+                </div>
+                <div v-if="workerCards.length" class="worker-list">
+                  <div v-for="worker in workerCards" :key="worker.name" class="worker-card">
+                    <div class="worker-row">
+                      <strong>{{ worker.name }}</strong>
+                      <span
+                        class="mini-pill"
+                        :data-tone="worker.paused ? 'warn' : (worker.is_alive ? 'good' : 'bad')"
+                      >
+                        {{ worker.paused ? '已暂停' : (worker.is_alive ? '运行中' : '已停止') }}
+                      </span>
+                    </div>
+                    <p>源频道：{{ worker.source }}</p>
+                    <p>账号目标：{{ worker.targets.join('、') }}</p>
+                    <p v-if="worker.bot_targets && worker.bot_targets.length">Bot 目标：{{ worker.bot_targets.join('、') }}</p>
+                    <p>发送策略：{{ getForwardStrategyLabel(worker.forward_strategy) }}</p>
+                    <p>进程 PID：{{ worker.pid || '-' }}</p>
+                    <p>最近退出码：{{ worker.exit_code == null ? '-' : worker.exit_code }}</p>
+                    <p>连续失败：{{ worker.failure_count || 0 }} 次</p>
+                    <p v-if="worker.pause_reason" class="dispatch-history-note">{{ worker.pause_reason }}</p>
+                    <p>监听编辑：{{ worker.include_edits ? '开启' : '关闭' }}</p>
+                    <p>转发自己消息：{{ worker.forward_own_messages ? '开启' : '关闭' }}</p>
+                  </div>
+                </div>
+                <div v-else class="empty-state">
+                  还没有运行中的任务。保存并校验规则后，点击“启动后端”即可开始实时监听。
+                </div>
+              </section>
+
+              <section v-if="validation" class="subpanel">
+                <div class="panel-head">
+                  <div>
+                    <h2>校验结果</h2>
+                    <p class="panel-subtext">校验通过后，这些规则会被加载为实际运行任务。</p>
+                  </div>
+                  <span class="panel-meta">{{ validation.workers.length }} 条可运行规则</span>
+                </div>
+                <div class="worker-list">
+                  <div v-for="worker in validation.workers" :key="worker.name" class="worker-card">
+                    <div class="worker-row">
+                      <strong>{{ worker.name }}</strong>
+                      <span class="mini-pill" data-tone="good">校验通过</span>
+                    </div>
+                    <p>源频道：{{ worker.source }}</p>
+                    <p>账号目标：{{ worker.targets.join('、') }}</p>
+                    <p v-if="worker.bot_targets && worker.bot_targets.length">Bot 目标：{{ worker.bot_targets.join('、') }}</p>
+                    <p>发送策略：{{ getForwardStrategyLabel(worker.forward_strategy) }}</p>
+                    <p>监听编辑：{{ worker.include_edits ? '开启' : '关闭' }}</p>
+                    <p>转发自己消息：{{ worker.forward_own_messages ? '开启' : '关闭' }}</p>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </article>
+
+          <article v-show="ui.activeTab === 'logs'" class="panel">
+            <div class="panel-head panel-head-wrap">
+              <div>
+                <h2>最近日志</h2>
+                <p class="panel-subtext">这里可以看到加载规则、自动转发、Bot 转发和手动指定转发等实时日志。切到“转发监测”就能只看具体转发了什么。</p>
+              </div>
+              <div class="log-head-meta">
+                <span class="log-order-badge">最新在上</span>
+              </div>
+            </div>
+            <div class="log-filter-bar">
+              <button class="chip-btn" :data-active="ui.logFilter === 'monitor'" @click="setLogFilter('monitor')">
+                转发监测 {{ monitorLogCount }}
+              </button>
+              <button class="chip-btn" :data-active="ui.logFilter === 'all'" @click="setLogFilter('all')">
+                全部日志 {{ sortedLogs.length }}
+              </button>
+              <button class="chip-btn" :data-active="ui.logFilter === 'error'" @click="setLogFilter('error')">
+                错误日志 {{ errorLogCount }}
+              </button>
+              <span class="log-filter-note">实时刷新，最新一条固定显示在最上面。</span>
+            </div>
+            <div ref="logBox" class="log-box" @scroll.passive="handleLogBoxScroll">
+              <div v-if="!filteredLogs.length" class="log-empty">当前筛选下还没有日志输出。</div>
+              <div
+                v-for="(item, index) in filteredLogs"
+                :key="item.sequence || index"
+                class="log-line"
+                :data-monitor="item.monitor ? 'true' : 'false'"
+                :data-level="item.level"
+              >
+                <div class="log-time-wrap">
+                  <span class="log-time">{{ formatDateTime(item.created_at) }}</span>
+                  <span v-if="index === 0" class="log-fresh-badge">最新</span>
+                </div>
+                <span class="log-level">{{ item.level }}</span>
+                <span class="log-name">{{ item.logger }}</span>
+                <span class="log-message">{{ displayLogMessage(item) }}</span>
+                <details v-if="item.full_content" class="log-details">
+                  <summary>查看完整内容</summary>
+                  <pre class="log-full-content">{{ item.full_content }}</pre>
+                </details>
+              </div>
+            </div>
+          </article>
+        </section>
+        <button
+          v-if="ui.activeTab === 'logs' && ui.showLogBottom"
+          class="log-jump-btn"
+          type="button"
+          @click="scrollLogBoxToBottom"
+        >
+          日志到底
+        </button>
+        <button
+          v-if="ui.showBackToTop"
+          class="back-to-top-btn"
+          type="button"
+          @click="scrollToTop"
+        >
+          返回顶部
+        </button>
+      </template>
+    </main>
+  `,
+}).mount("#app");
