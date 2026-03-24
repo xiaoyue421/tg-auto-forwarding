@@ -24,6 +24,7 @@ from tg_forwarder.dashboard_actions import (
     build_user_client,
     close_bot_forward_contexts,
     resolve_targets,
+    safe_get_entity,
 )
 from tg_forwarder.dispatch_queue import (
     DELIVERY_CHANNEL_ACCOUNT,
@@ -61,10 +62,11 @@ JOB_POLL_INTERVAL_SECONDS = 0.25
 class DispatchRuntimeContext:
     runtime: WorkerRuntimeConfig
     user_client: object
-    source_entity: object
+    source_entity_map: dict[str, object]
     account_target_map: dict[str, tuple[ForwardTarget, object]]
     bot_target_map: dict[str, ForwardTarget]
     bot_contexts: list[BotForwardContext]
+    bot_source_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -130,11 +132,13 @@ class PersistentQueueDispatcher:
             runtime = worker_runtime_from_payload(json.loads(job.runtime_payload_json))
             runtime_key = worker_config_digest(runtime)
             context = await self._get_runtime_context(runtime_key, runtime)
-            message = await context.user_client.get_messages(context.source_entity, ids=job.message_id)
+            source_key = str(job.source_chat)
+            source_entity = await self._get_source_entity(context, source_key)
+            message = await context.user_client.get_messages(source_entity, ids=job.message_id)
             log_context = ForwardLogContext(
                 mode="自动队列",
                 rule_name=runtime.name,
-                source=str(runtime.source),
+                source=source_key,
             )
             if message is None:
                 await self._fail_remaining_deliveries(job.id, "message not found")
@@ -204,6 +208,7 @@ class PersistentQueueDispatcher:
                     message=message,
                     batch=active_batch,
                     log_context=log_context,
+                    source_key=source_key,
                 )
 
             return self._get_inter_job_delay(runtime, attempted_dispatch)
@@ -222,7 +227,10 @@ class PersistentQueueDispatcher:
         message: object,
         batch: list[DispatchQueueDelivery],
         log_context: ForwardLogContext,
+        source_key: str,
     ) -> None:
+        if any(delivery.channel == DELIVERY_CHANNEL_BOT for delivery in batch):
+            await self._prepare_bot_contexts_for_source(context, source_key)
         for delivery in batch:
             result = await self._dispatch_single_delivery(
                 context=context,
@@ -532,7 +540,10 @@ class PersistentQueueDispatcher:
         if not await user_client.is_user_authorized():
             raise ConfigError(f"worker `{runtime.name}` session is not authorized, run login first")
 
-        source_entity = await user_client.get_input_entity(runtime.source)
+        source_entity_map = {
+            str(source): await user_client.get_input_entity(source)
+            for source in runtime.sources
+        }
         resolved_targets = await resolve_targets(user_client, runtime.targets)
         account_target_map = {
             str(target.chat): (target, entity)
@@ -544,7 +555,7 @@ class PersistentQueueDispatcher:
         if runtime.bot_targets and runtime.telegram.bot_tokens:
             bot_contexts = await build_bot_forward_contexts(
                 settings=runtime.telegram,
-                source_reference=runtime.source,
+                source_reference=runtime.primary_source,
                 targets=runtime.bot_targets,
                 logger=self.logger,
                 log_scope=f"queue dispatcher `{runtime.name}`",
@@ -553,13 +564,32 @@ class PersistentQueueDispatcher:
         context = DispatchRuntimeContext(
             runtime=runtime,
             user_client=user_client,
-            source_entity=source_entity,
+            source_entity_map=source_entity_map,
             account_target_map=account_target_map,
             bot_target_map=bot_target_map,
             bot_contexts=bot_contexts,
         )
         self._runtime_contexts[runtime_key] = context
         return context
+
+    async def _get_source_entity(self, context: DispatchRuntimeContext, source_key: str) -> object:
+        source_entity = context.source_entity_map.get(source_key)
+        if source_entity is not None:
+            return source_entity
+        source_entity = await context.user_client.get_input_entity(source_key)
+        context.source_entity_map[source_key] = source_entity
+        return source_entity
+
+    async def _prepare_bot_contexts_for_source(
+        self,
+        context: DispatchRuntimeContext,
+        source_key: str,
+    ) -> None:
+        if context.bot_source_key == source_key:
+            return
+        for bot_context in context.bot_contexts:
+            bot_context.source_entity = await safe_get_entity(bot_context.client, source_key)
+        context.bot_source_key = source_key
 
     def _context_is_ready(self, context: DispatchRuntimeContext) -> bool:
         user_client = context.user_client

@@ -172,7 +172,7 @@ class FilterConfig:
 @dataclass(slots=True)
 class WorkerConfig:
     name: str
-    source: str | int
+    sources: list[str | int]
     targets: list[ForwardTarget]
     bot_targets: list[ForwardTarget] = field(default_factory=list)
     forward_strategy: str | None = None
@@ -183,11 +183,19 @@ class WorkerConfig:
     session_file: str | None = None
     filters: FilterConfig = field(default_factory=FilterConfig)
 
+    @property
+    def primary_source(self) -> str | int:
+        return self.sources[0]
+
+    @property
+    def source(self) -> str | int:
+        return self.primary_source
+
 
 @dataclass(slots=True)
 class WorkerRuntimeConfig:
     name: str
-    source: str | int
+    sources: list[str | int]
     targets: list[ForwardTarget]
     bot_targets: list[ForwardTarget]
     forward_strategy: str | None
@@ -196,8 +204,18 @@ class WorkerRuntimeConfig:
     filters: FilterConfig
     telegram: TelegramSettings
 
+    @property
+    def primary_source(self) -> str | int:
+        return self.sources[0]
+
+    @property
+    def source(self) -> str | int:
+        return self.primary_source
+
     def as_payload(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["source"] = self.primary_source
+        return payload
 
 
 @dataclass(slots=True)
@@ -253,7 +271,7 @@ class AppConfig:
             runtime_workers.append(
                 WorkerRuntimeConfig(
                     name=worker.name,
-                    source=worker.source,
+                    sources=list(worker.sources),
                     targets=worker.targets,
                     bot_targets=worker.bot_targets,
                     forward_strategy=worker.forward_strategy,
@@ -460,7 +478,7 @@ def build_legacy_env_worker(
     env_values: dict[str, str],
     default_worker_name: str,
 ) -> WorkerConfig:
-    source = parse_chat_reference(
+    sources = parse_source_references(
         env_required_from(env_values, "TG_SOURCE_CHAT", "simple mode requires TG_SOURCE_CHAT"),
         "TG_SOURCE_CHAT",
     )
@@ -472,7 +490,7 @@ def build_legacy_env_worker(
         raise ConfigError("simple mode requires TG_TARGET_CHATS or TG_BOT_TARGET_CHATS")
     return WorkerConfig(
         name=default_worker_name,
-        source=source,
+        sources=sources,
         targets=targets,
         bot_targets=bot_targets,
         forward_strategy=normalize_optional_forward_strategy(
@@ -674,7 +692,10 @@ def parse_workers(
         if name in seen_names:
             raise ConfigError(f"duplicate worker name `{name}`")
         seen_names.add(name)
-        source = parse_chat_reference(raw_worker.get("source"), f"workers[{index}].source")
+        sources = parse_source_references(
+            raw_worker.get("sources", raw_worker.get("source")),
+            f"workers[{index}].sources",
+        )
         targets = parse_optional_targets(raw_worker.get("targets"), f"workers[{index}].targets")
         bot_targets = parse_optional_targets(
             raw_worker.get("bot_targets"),
@@ -694,7 +715,7 @@ def parse_workers(
         workers.append(
             WorkerConfig(
                 name=name,
-                source=source,
+                sources=sources,
                 targets=targets,
                 bot_targets=bot_targets,
                 forward_strategy=normalize_optional_forward_strategy(
@@ -855,6 +876,37 @@ def parse_chat_reference(value: Any, field_name: str) -> str | int:
             return int(cleaned)
         return cleaned
     raise ConfigError(f"{field_name} must be a channel username or numeric id")
+
+
+def parse_source_references(value: Any, field_name: str) -> list[str | int]:
+    if value in (None, ""):
+        raise ConfigError(f"{field_name} is required")
+
+    raw_items: list[Any]
+    if isinstance(value, list):
+        raw_items = list(value)
+    elif isinstance(value, int):
+        raw_items = [value]
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ConfigError(f"{field_name} is required")
+        raw_items = parse_list_value(text)
+    else:
+        raise ConfigError(f"{field_name} must be a channel username, numeric id or list")
+
+    sources: list[str | int] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_items, start=1):
+        source = parse_chat_reference(item, f"{field_name}[{index}]")
+        source_key = str(source)
+        if source_key in seen:
+            continue
+        seen.add(source_key)
+        sources.append(source)
+    if not sources:
+        raise ConfigError(f"{field_name} is required")
+    return sources
 
 
 def parse_proxy_value_list(value: Any, field_name: str) -> list[ProxyConfig]:
@@ -1253,7 +1305,10 @@ def worker_runtime_from_payload(payload: dict[str, Any]) -> WorkerRuntimeConfig:
     )
     return WorkerRuntimeConfig(
         name=str(payload["name"]),
-        source=payload["source"],
+        sources=parse_source_references(
+            payload.get("sources", payload.get("source")),
+            "worker.sources",
+        ),
         targets=[ForwardTarget(**target) for target in targets_data],
         bot_targets=[ForwardTarget(**target) for target in payload.get("bot_targets", [])],
         forward_strategy=normalize_optional_forward_strategy(

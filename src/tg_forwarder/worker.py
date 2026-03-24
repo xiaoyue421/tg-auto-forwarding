@@ -48,11 +48,11 @@ class ChannelWorker:
         self.queue_db_path = queue_db_path
         self.logger = logging.getLogger(f"tg_forwarder.worker.{runtime.name}")
         self._active_tasks: set[asyncio.Task[None]] = set()
-        self._persisted_message_cursor = 0
-        self._recent_new_message_ids: set[int] = set()
-        self._recent_new_message_order: deque[int] = deque()
-        self._completed_message_ids: set[int] = set()
-        self._cursor_lock = asyncio.Lock()
+        self._persisted_message_cursors: dict[str, int] = {}
+        self._recent_new_message_ids: dict[str, set[int]] = {}
+        self._recent_new_message_orders: dict[str, deque[int]] = {}
+        self._completed_message_ids: dict[str, set[int]] = {}
+        self._cursor_locks: dict[str, asyncio.Lock] = {}
 
     async def run(self) -> None:
         client: TelegramClient | None = None
@@ -68,36 +68,38 @@ class ChannelWorker:
                     f"worker `{self.runtime.name}` session is not authorized, run login first"
                 )
 
-            source_entity = await client.get_input_entity(self.runtime.source)
-            await self._initialize_message_cursor(client, source_entity)
+            source_entities: dict[str, object] = {}
+            for source in self.runtime.sources:
+                source_key = str(source)
+                self._ensure_source_state(source_key)
+                source_entities[source_key] = await client.get_input_entity(source)
+                await self._initialize_message_cursor(client, source_key, source_entities[source_key])
 
             self.logger.info(
-                "listening source=%s, include_edits=%s, forward_own_messages=%s, queue_db_path=%s, cursor=%s, catch_up_interval=%.1fs, catch_up_batch=%s",
-                self.runtime.source,
+                "listening sources=%s, include_edits=%s, forward_own_messages=%s, queue_db_path=%s, cursors=%s, catch_up_interval=%.1fs, catch_up_batch=%s",
+                self._format_source_list(),
                 self.runtime.include_edits,
                 self.runtime.forward_own_messages,
                 self.queue_db_path or "-",
-                self._persisted_message_cursor,
+                self._format_cursors(),
                 CATCH_UP_INTERVAL_SECONDS,
                 CATCH_UP_BATCH_SIZE,
             )
 
-            async def handle_new_message(event: object) -> None:
-                await self._schedule_message(message=event.message, is_edit=False)
-
-            async def handle_edited_message(event: object) -> None:
-                await self._schedule_message(message=event.message, is_edit=True)
-
-            client.add_event_handler(handle_new_message, events.NewMessage(chats=source_entity))
-            if self.runtime.include_edits:
+            for source_key, source_entity in source_entities.items():
                 client.add_event_handler(
-                    handle_edited_message,
-                    events.MessageEdited(chats=source_entity),
+                    self._build_event_handler(source_key=source_key, is_edit=False),
+                    events.NewMessage(chats=source_entity),
                 )
+                if self.runtime.include_edits:
+                    client.add_event_handler(
+                        self._build_event_handler(source_key=source_key, is_edit=True),
+                        events.MessageEdited(chats=source_entity),
+                    )
 
             stop_task = asyncio.create_task(self._watch_stop_signal(client))
             catch_up_task = asyncio.create_task(
-                self._catch_up_loop(client=client, source_entity=source_entity)
+                self._catch_up_loop(client=client, source_entities=source_entities)
             )
             try:
                 await client.run_until_disconnected()
@@ -113,8 +115,15 @@ class ChannelWorker:
             with suppress(Exception):
                 await client.disconnect()
 
-    def _build_user_client(self) -> TelegramClient:
-        return self._build_user_client_with_proxy(None)
+    def _build_event_handler(self, *, source_key: str, is_edit: bool):
+        async def handle_event(event: object) -> None:
+            await self._schedule_message(
+                message=getattr(event, "message", None),
+                source_key=source_key,
+                is_edit=is_edit,
+            )
+
+        return handle_event
 
     def _build_user_client_with_proxy(self, proxy: object | None) -> TelegramClient:
         if self.runtime.telegram.session_string:
@@ -133,24 +142,46 @@ class ChannelWorker:
             proxy=proxy,
         )
 
-    async def _initialize_message_cursor(self, client: TelegramClient, source_entity: object) -> None:
+    def _ensure_source_state(self, source_key: str) -> None:
+        self._persisted_message_cursors.setdefault(source_key, 0)
+        self._recent_new_message_ids.setdefault(source_key, set())
+        self._recent_new_message_orders.setdefault(source_key, deque())
+        self._completed_message_ids.setdefault(source_key, set())
+        self._cursor_locks.setdefault(source_key, asyncio.Lock())
+
+    def _format_source_list(self) -> str:
+        return ", ".join(str(source) for source in self.runtime.sources) or "-"
+
+    def _format_cursors(self) -> str:
+        parts = [
+            f"{source_key}={self._persisted_message_cursors.get(source_key, 0)}"
+            for source_key in (str(source) for source in self.runtime.sources)
+        ]
+        return ", ".join(parts) or "-"
+
+    async def _initialize_message_cursor(
+        self,
+        client: TelegramClient,
+        source_key: str,
+        source_entity: object,
+    ) -> None:
         if self.queue_db_path:
             stored_offset = await asyncio.to_thread(
                 get_worker_offset,
                 self.queue_db_path,
                 self.runtime.name,
-                str(self.runtime.source),
+                source_key,
             )
             if stored_offset is not None:
-                self._persisted_message_cursor = max(0, int(stored_offset))
+                self._persisted_message_cursors[source_key] = max(0, int(stored_offset))
                 return
 
         latest_messages = await client.get_messages(source_entity, limit=1)
         latest_message = latest_messages[0] if latest_messages else None
-        self._persisted_message_cursor = int(getattr(latest_message, "id", 0) or 0)
-        await self._persist_cursor()
+        self._persisted_message_cursors[source_key] = int(getattr(latest_message, "id", 0) or 0)
+        await self._persist_cursor(source_key)
 
-    async def _schedule_message(self, *, message: object, is_edit: bool) -> None:
+    async def _schedule_message(self, *, message: object, source_key: str, is_edit: bool) -> None:
         try:
             if message is None:
                 return
@@ -158,41 +189,61 @@ class ChannelWorker:
             if message_id <= 0:
                 return
 
-            if not is_edit and not self._remember_new_message_id(message_id):
+            if not is_edit and not self._remember_new_message_id(source_key, message_id):
                 return
 
-            task = asyncio.create_task(self._process_message(message=message, is_edit=is_edit))
+            task = asyncio.create_task(
+                self._process_message(message=message, source_key=source_key, is_edit=is_edit)
+            )
             self._track_task(task)
         except Exception:
             self.logger.exception("unexpected error while scheduling message")
 
-    async def _catch_up_loop(self, *, client: TelegramClient, source_entity: object) -> None:
+    async def _catch_up_loop(
+        self,
+        *,
+        client: TelegramClient,
+        source_entities: dict[str, object],
+    ) -> None:
         while not self.stop_event.is_set():
-            recovered_count = 0
+            recovered_total = 0
+            recovered_notes: list[str] = []
             try:
-                recovered_count = await self._catch_up_messages(
-                    client=client,
-                    source_entity=source_entity,
-                )
-                if recovered_count > 0:
+                for source_key, source_entity in source_entities.items():
+                    recovered_count = await self._catch_up_messages(
+                        client=client,
+                        source_key=source_key,
+                        source_entity=source_entity,
+                    )
+                    if recovered_count > 0:
+                        recovered_total += recovered_count
+                        recovered_notes.append(f"{source_key}={recovered_count}")
+                if recovered_total > 0:
                     self.logger.info(
-                        "补抓到 %s 条未处理消息，正在按规则检查并准备转发，rule=%s，cursor=%s",
-                        recovered_count,
+                        "补抓到 %s 条未处理消息，正在按规则检查并准备转发，rule=%s，sources=%s，cursors=%s",
+                        recovered_total,
                         self.runtime.name,
-                        self._persisted_message_cursor,
+                        ", ".join(recovered_notes),
+                        self._format_cursors(),
                         extra={"monitor": True},
                     )
             except Exception:
                 self.logger.exception("补抓未处理消息失败，rule=%s", self.runtime.name)
 
-            sleep_seconds = 0.1 if recovered_count > 0 else CATCH_UP_INTERVAL_SECONDS
+            sleep_seconds = 0.1 if recovered_total > 0 else CATCH_UP_INTERVAL_SECONDS
             await asyncio.sleep(sleep_seconds)
 
-    async def _catch_up_messages(self, *, client: TelegramClient, source_entity: object) -> int:
+    async def _catch_up_messages(
+        self,
+        *,
+        client: TelegramClient,
+        source_key: str,
+        source_entity: object,
+    ) -> int:
         recovered_count = 0
         async for message in client.iter_messages(
             source_entity,
-            min_id=self._persisted_message_cursor,
+            min_id=self._persisted_message_cursors.get(source_key, 0),
             reverse=True,
             limit=CATCH_UP_BATCH_SIZE,
         ):
@@ -201,27 +252,33 @@ class ChannelWorker:
             message_id = int(getattr(message, "id", 0) or 0)
             if message_id <= 0:
                 continue
-            if not self._remember_new_message_id(message_id):
+            if not self._remember_new_message_id(source_key, message_id):
                 continue
             recovered_count += 1
-            task = asyncio.create_task(self._process_message(message=message, is_edit=False))
+            task = asyncio.create_task(
+                self._process_message(message=message, source_key=source_key, is_edit=False)
+            )
             self._track_task(task)
         return recovered_count
 
-    async def _process_message(self, *, message: object, is_edit: bool) -> None:
+    async def _process_message(self, *, message: object, source_key: str, is_edit: bool) -> None:
         message_id = int(getattr(message, "id", 0) or 0)
         handled_successfully = False
         try:
-            handled_successfully = await self._handle_message(message=message, is_edit=is_edit)
+            handled_successfully = await self._handle_message(
+                message=message,
+                source_key=source_key,
+                is_edit=is_edit,
+            )
             if handled_successfully and not is_edit:
-                await self._mark_message_handled(message_id)
+                await self._mark_message_handled(source_key, message_id)
         except Exception:
             self.logger.exception("unexpected error while handling message")
         finally:
             if not is_edit and not handled_successfully and message_id > 0:
-                self._forget_new_message_id(message_id)
+                self._forget_new_message_id(source_key, message_id)
 
-    async def _handle_message(self, *, message: object, is_edit: bool) -> bool:
+    async def _handle_message(self, *, message: object, source_key: str, is_edit: bool) -> bool:
         if message is None:
             return True
         if getattr(message, "action", None) is not None:
@@ -236,7 +293,7 @@ class ChannelWorker:
                 context=ForwardLogContext(
                     mode="自动",
                     rule_name=self.runtime.name,
-                    source=str(self.runtime.source),
+                    source=source_key,
                 ),
                 note="可开启“转发自己发送的消息（测试用）”后再测试。",
             )
@@ -252,7 +309,7 @@ class ChannelWorker:
                 context=ForwardLogContext(
                     mode="自动",
                     rule_name=self.runtime.name,
-                    source=str(self.runtime.source),
+                    source=source_key,
                 ),
                 note=build_mismatch_note(match_result, self.runtime.filters),
             )
@@ -260,6 +317,7 @@ class ChannelWorker:
 
         return await self._enqueue_message_for_dispatch(
             message,
+            source_key=source_key,
             is_edit=is_edit,
             match_note=build_match_note(match_result),
         )
@@ -268,6 +326,7 @@ class ChannelWorker:
         self,
         message: object,
         *,
+        source_key: str,
         is_edit: bool,
         match_note: str | None = None,
     ) -> bool:
@@ -281,7 +340,7 @@ class ChannelWorker:
         log_context = ForwardLogContext(
             mode="自动队列",
             rule_name=self.runtime.name,
-            source=str(self.runtime.source),
+            source=source_key,
         )
         effective_strategy = resolve_forward_strategy(
             self.runtime.forward_strategy,
@@ -294,13 +353,13 @@ class ChannelWorker:
             self.runtime.bot_targets,
             f"worker `{self.runtime.name}`.forward_strategy",
         )
-        unique_key = self._build_queue_unique_key(message)
+        unique_key = self._build_queue_unique_key(source_key, message)
         enqueue_result = await asyncio.to_thread(
             enqueue_dispatch_job,
             self.queue_db_path,
             DispatchQueueJobInsert(
                 unique_key=unique_key,
-                source_chat=str(self.runtime.source),
+                source_chat=source_key,
                 message_id=int(getattr(message, "id")),
                 rule_name=self.runtime.name,
                 runtime_payload_json=json.dumps(
@@ -378,52 +437,57 @@ class ChannelWorker:
         )
         return True
 
-    async def _mark_message_handled(self, message_id: int) -> None:
+    async def _mark_message_handled(self, source_key: str, message_id: int) -> None:
         if message_id <= 0:
             return
-        async with self._cursor_lock:
-            if message_id <= self._persisted_message_cursor:
-                self._completed_message_ids.discard(message_id)
+        lock = self._cursor_locks[source_key]
+        async with lock:
+            current_cursor = self._persisted_message_cursors.get(source_key, 0)
+            completed_ids = self._completed_message_ids[source_key]
+            if message_id <= current_cursor:
+                completed_ids.discard(message_id)
                 return
 
-            self._completed_message_ids.add(message_id)
-            next_cursor = self._persisted_message_cursor + 1
-            advanced_cursor = self._persisted_message_cursor
-            while next_cursor in self._completed_message_ids:
-                self._completed_message_ids.remove(next_cursor)
+            completed_ids.add(message_id)
+            next_cursor = current_cursor + 1
+            advanced_cursor = current_cursor
+            while next_cursor in completed_ids:
+                completed_ids.remove(next_cursor)
                 advanced_cursor = next_cursor
                 next_cursor += 1
 
-            if advanced_cursor > self._persisted_message_cursor:
-                self._persisted_message_cursor = advanced_cursor
-                await self._persist_cursor()
+            if advanced_cursor > current_cursor:
+                self._persisted_message_cursors[source_key] = advanced_cursor
+                await self._persist_cursor(source_key)
 
-    async def _persist_cursor(self) -> None:
+    async def _persist_cursor(self, source_key: str) -> None:
         if not self.queue_db_path:
             return
         await asyncio.to_thread(
             set_worker_offset,
             self.queue_db_path,
             self.runtime.name,
-            str(self.runtime.source),
-            self._persisted_message_cursor,
+            source_key,
+            self._persisted_message_cursors.get(source_key, 0),
         )
 
-    def _build_queue_unique_key(self, message: object) -> str:
-        return f"{self.runtime.name}|{self.runtime.source}|{int(getattr(message, 'id'))}"
+    def _build_queue_unique_key(self, source_key: str, message: object) -> str:
+        return f"{self.runtime.name}|{source_key}|{int(getattr(message, 'id'))}"
 
-    def _remember_new_message_id(self, message_id: int) -> bool:
-        if message_id in self._recent_new_message_ids:
+    def _remember_new_message_id(self, source_key: str, message_id: int) -> bool:
+        recent_ids = self._recent_new_message_ids[source_key]
+        if message_id in recent_ids:
             return False
-        self._recent_new_message_ids.add(message_id)
-        self._recent_new_message_order.append(message_id)
-        while len(self._recent_new_message_order) > RECENT_SEEN_CACHE_LIMIT:
-            expired_id = self._recent_new_message_order.popleft()
-            self._recent_new_message_ids.discard(expired_id)
+        recent_ids.add(message_id)
+        recent_order = self._recent_new_message_orders[source_key]
+        recent_order.append(message_id)
+        while len(recent_order) > RECENT_SEEN_CACHE_LIMIT:
+            expired_id = recent_order.popleft()
+            recent_ids.discard(expired_id)
         return True
 
-    def _forget_new_message_id(self, message_id: int) -> None:
-        self._recent_new_message_ids.discard(message_id)
+    def _forget_new_message_id(self, source_key: str, message_id: int) -> None:
+        self._recent_new_message_ids[source_key].discard(message_id)
 
     def _track_task(self, task: asyncio.Task[None]) -> None:
         self._active_tasks.add(task)

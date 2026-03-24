@@ -377,7 +377,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             "TG_STARTUP_NOTIFY_MESSAGE": quote_env_value(payload.startup_notify_message),
             "TG_PROXY_URLS": "",
             "TG_PROXY_LIST": "",
-            "TG_SOURCE_CHAT": first_rule.source_chat.strip(),
+            "TG_SOURCE_CHAT": ",".join(split_list_value(first_rule.source_chat)),
             "TG_TARGET_CHATS": first_rule.target_chats.strip(),
             "TG_BOT_TARGET_CHATS": first_rule.bot_target_chats.strip(),
             "TG_WORKER_NAME": first_rule.name.strip() or "rule_1",
@@ -627,8 +627,7 @@ def rule_payload_from_dict(raw_rule: object, index: int) -> RulePayload:
     if not isinstance(filters, dict):
         filters = {}
 
-    source = raw_rule.get("source")
-    source_chat = "" if source in (None, "") else str(source).strip()
+    source_chat = sources_to_text(raw_rule.get("sources", raw_rule.get("source")))
     targets = targets_to_text(raw_rule.get("targets"))
     name = str(raw_rule.get("name") or f"rule_{index}").strip() or f"rule_{index}"
 
@@ -659,6 +658,19 @@ def rule_payload_from_dict(raw_rule: object, index: int) -> RulePayload:
         ),
         case_sensitive=bool(filters.get("case_sensitive", False)),
     )
+
+
+def sources_to_text(raw_sources: object) -> str:
+    if raw_sources in (None, ""):
+        return ""
+    if isinstance(raw_sources, list):
+        values = [
+            str(item).strip()
+            for item in raw_sources
+            if item not in (None, "") and str(item).strip()
+        ]
+        return "\n".join(values)
+    return str(raw_sources).strip()
 
 
 def targets_to_text(raw_targets: object) -> str:
@@ -702,10 +714,11 @@ def split_regex_text(value: str) -> list[str]:
 def serialize_rules_to_json(rules: list[RulePayload]) -> str:
     serialized_rules: list[dict[str, object]] = []
     for index, rule in enumerate(rules, start=1):
+        source_values = split_list_value(rule.source_chat)
         item: dict[str, object] = {
             "name": rule.name.strip() or f"rule_{index}",
             "enabled": bool(rule.enabled),
-            "source": rule.source_chat.strip(),
+            "sources": source_values,
             "targets": split_list_value(rule.target_chats),
             "bot_targets": split_list_value(rule.bot_target_chats),
             "include_edits": bool(rule.include_edits),

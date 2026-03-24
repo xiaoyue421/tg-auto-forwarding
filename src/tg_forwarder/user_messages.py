@@ -74,6 +74,10 @@ def translate_error(message: str) -> str:
         return "请给每条转发规则填写名称。"
     if message.startswith("workers[") and ".source is required" in message:
         return "请给规则填写源频道。"
+    if message.startswith("workers[") and ".sources is required" in message:
+        return "请给规则填写源频道。"
+    if message.startswith("workers[") and ".sources[" in message and "is required" in message:
+        return "请给规则填写源频道。"
     if message.startswith("workers[") and ".targets must be a non-empty list" in message:
         return "请给规则至少填写一个目标频道。"
     if message.startswith("workers[") and "must set at least one target in targets or bot_targets" in message:

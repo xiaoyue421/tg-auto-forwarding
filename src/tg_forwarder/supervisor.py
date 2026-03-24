@@ -27,6 +27,7 @@ from tg_forwarder.worker import run_worker_process
 class WorkerSnapshot:
     name: str
     source: str | int
+    sources: list[str | int]
     targets: list[str | int]
     bot_targets: list[str | int]
     forward_strategy: str
@@ -137,6 +138,7 @@ class ProcessSupervisor:
                 WorkerSnapshot(
                     name=managed.runtime.name,
                     source=managed.runtime.source,
+                    sources=list(managed.runtime.sources),
                     targets=[target.chat for target in managed.runtime.targets],
                     bot_targets=[target.chat for target in managed.runtime.bot_targets],
                     forward_strategy=resolve_forward_strategy(

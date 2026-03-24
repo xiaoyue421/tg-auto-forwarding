@@ -107,7 +107,8 @@ def validate_command(config_path: str) -> int:
     print(f"Loaded from: {config.config_path}")
     for worker in runtime_workers:
         targets = ", ".join(str(target.chat) for target in worker.targets)
-        print(f"- {worker.name}: {worker.source} -> {targets}")
+        sources = ", ".join(str(source) for source in worker.sources)
+        print(f"- {worker.name}: {sources} -> {targets}")
     return 0
 
 

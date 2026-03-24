@@ -268,26 +268,27 @@ async def _manual_forward_message(
 def build_source_index(config: AppConfig) -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
     for worker in config.workers:
-        source_key = str(worker.source)
-        if source_key not in index:
-            index[source_key] = {
-                "source": worker.source,
-                "rules": [],
-                "default_targets": [],
-                "default_bot_targets": [],
-                "forward_strategies": [],
-            }
-        meta = index[source_key]
-        meta["rules"].append(worker.name)
-        append_unique_targets(meta["default_targets"], worker.targets)
-        append_unique_targets(meta["default_bot_targets"], worker.bot_targets)
-        effective_strategy = resolve_forward_strategy(
-            worker.forward_strategy,
-            config.telegram.forward_strategy,
-            f"worker `{worker.name}`.forward_strategy",
-        )
-        if effective_strategy not in meta["forward_strategies"]:
-            meta["forward_strategies"].append(effective_strategy)
+        for source in worker.sources:
+            source_key = str(source)
+            if source_key not in index:
+                index[source_key] = {
+                    "source": source,
+                    "rules": [],
+                    "default_targets": [],
+                    "default_bot_targets": [],
+                    "forward_strategies": [],
+                }
+            meta = index[source_key]
+            meta["rules"].append(worker.name)
+            append_unique_targets(meta["default_targets"], worker.targets)
+            append_unique_targets(meta["default_bot_targets"], worker.bot_targets)
+            effective_strategy = resolve_forward_strategy(
+                worker.forward_strategy,
+                config.telegram.forward_strategy,
+                f"worker `{worker.name}`.forward_strategy",
+            )
+            if effective_strategy not in meta["forward_strategies"]:
+                meta["forward_strategies"].append(effective_strategy)
     for meta in index.values():
         strategies = meta.pop("forward_strategies", [])
         meta["default_forward_strategy"] = strategies[0] if len(strategies) == 1 else ""

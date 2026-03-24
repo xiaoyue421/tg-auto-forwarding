@@ -77,6 +77,7 @@ class SupervisorService:
                 {
                     "name": worker.name,
                     "source": worker.source,
+                    "sources": list(worker.sources),
                     "targets": [target.chat for target in worker.targets],
                     "bot_targets": [target.chat for target in worker.bot_targets],
                     "forward_strategy": resolve_forward_strategy(

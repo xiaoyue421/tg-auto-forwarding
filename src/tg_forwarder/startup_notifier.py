@@ -27,19 +27,23 @@ from tg_forwarder.dashboard_actions import build_bot_client, build_user_client
 STARTUP_NOTIFY_BOT_INIT_TIMEOUT_SECONDS = 25
 
 
-DEFAULT_STARTUP_NOTIFY_MESSAGE = f"""<b>🎉 欢迎使用 TG转发!</b>
+DEFAULT_STARTUP_NOTIFY_MESSAGE = f"""<b>TelegramForwarder 已成功启动</b>
 
-如果您觉得这个项目对您有帮助，欢迎通过以下方式支持我:
+<b>欢迎使用 TelegramForwarder！</b>
 
-<blockquote><b>
+当前规则已经加载完成，系统开始实时监听并准备转发新消息。
 
-⭐ TG自动转发 ：<a href="https://github.com/xiaoyue421/tg-auto-forwarding" >给项目点个小小的 Star</a>
+如果这个项目对您有帮助，欢迎支持：
+[Star] <a href="https://github.com/Heavrnl/TelegramForwarder">项目点个小小的 Star</a>
+[Ko-fi] <a href="https://ko-fi.com/heavrnl">请我喝杯咖啡</a>
 
-</b></blockquote>
+当前版本：v{__version__}
+更新日志：<a href="https://github.com/Heavrnl/TelegramForwarder/releases">/changelog</a>
 
-当前版本: v1.0
+感谢您的支持！
 
-感谢您的支持!
+GitHub:
+https://github.com/Heavrnl/TelegramForwarder
 """
 
 
