@@ -935,6 +935,9 @@ export default dashboard;
                 </div>
               </section>
             </div>
+            <div v-else-if="search.loading" class="empty-state" data-tone="pending">
+              正在搜索… 上一次结果已清空，请稍候。
+            </div>
             <div v-else class="empty-state">
               还没有搜索结果。输入关键词后点“搜索所有源”，系统会做模糊匹配并按时间从新到旧展示。
             </div>

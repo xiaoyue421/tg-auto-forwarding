@@ -1200,6 +1200,9 @@ createApp({
         return;
       }
       this.search.loading = true;
+      this.search.results = [];
+      this.search.sourceFilter = "all";
+      this.search.forwardingKey = "";
       try {
         const response = await this.fetchJson("/api/search", {
           method: "POST",
