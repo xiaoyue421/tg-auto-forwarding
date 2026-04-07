@@ -200,43 +200,80 @@ export default dashboard;
                 <div>
                   <h3>网页登录 Telegram</h3>
                   <p class="panel-subtext">
-                    首次登录不用再回终端执行命令。填手机号，收验证码，在这里完成登录，成功后会自动保存到 .env。
+                    首次登录无需终端：可用短信验证码，或用手机 Telegram 扫描网页二维码（与桌面客户端扫码登录相同流程）。成功后会自动保存 session 到 .env。
                   </p>
                 </div>
                 <span class="mini-pill" :data-tone="hasSessionString ? 'good' : 'muted'">
                   {{ hasSessionString ? '已保存 session' : '未登录' }}
                 </span>
               </div>
+              <div class="login-method-toggle" role="group" aria-label="登录方式">
+                <button
+                  type="button"
+                  class="btn btn-small"
+                  :class="telegramLogin.method === 'phone' ? 'btn-primary' : 'btn-ghost'"
+                  :disabled="telegramLogin.busy"
+                  @click="setTelegramLoginMethod('phone')"
+                >
+                  验证码登录
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-small"
+                  :class="telegramLogin.method === 'qr' ? 'btn-primary' : 'btn-ghost'"
+                  :disabled="telegramLogin.busy"
+                  @click="setTelegramLoginMethod('qr')"
+                >
+                  扫码登录
+                </button>
+              </div>
               <p class="flow-hint">
-                <template v-if="telegramLogin.step === 'idle'">
-                  先填写手机号，然后点“发送验证码”。
+                <template v-if="telegramLogin.method === 'phone' && telegramLogin.step === 'idle'">
+                  先填写手机号，然后点「发送验证码」。
                 </template>
-                <template v-else-if="telegramLogin.step === 'code'">
+                <template v-else-if="telegramLogin.method === 'phone' && telegramLogin.step === 'code'">
                   验证码已发送到 {{ telegramLogin.phone }}，直接在这里输入即可。
+                </template>
+                <template v-else-if="telegramLogin.method === 'qr' && telegramLogin.step === 'qr_wait'">
+                  打开手机 Telegram → 设置 → 设备 → 链接桌面设备，扫描下方二维码（与登录桌面版 Telegram 相同）。
                 </template>
                 <template v-else-if="telegramLogin.step === 'password'">
                   这个账号开启了二步验证，请继续输入二步验证密码。
                 </template>
               </p>
+              <div v-if="telegramLogin.method === 'qr' && telegramLogin.step === 'qr_wait' && telegramLogin.qrPngBase64" class="telegram-qr-wrap">
+                <img
+                  class="telegram-qr-img"
+                  :src="'data:image/png;base64,' + telegramLogin.qrPngBase64"
+                  alt="Telegram 登录二维码"
+                  width="220"
+                  height="220"
+                />
+                <p v-if="telegramLogin.qrExpiresAt" class="qr-expires-hint">
+                  过期时间（UTC）：{{ telegramLogin.qrExpiresAt }}
+                </p>
+              </div>
               <div class="login-flow-grid">
-                <label>
-                  <span>手机号</span>
-                  <input
-                    v-model="telegramLogin.phone"
-                    inputmode="tel"
-                    placeholder="+8613800000000"
-                    @keyup.enter="requestTelegramCode"
-                  />
-                </label>
-                <label v-if="telegramLogin.step === 'code'">
-                  <span>验证码</span>
-                  <input
-                    v-model="telegramLogin.code"
-                    inputmode="numeric"
-                    placeholder="输入 Telegram 验证码"
-                    @keyup.enter="completeTelegramLogin"
-                  />
-                </label>
+                <template v-if="telegramLogin.method === 'phone'">
+                  <label>
+                    <span>手机号</span>
+                    <input
+                      v-model="telegramLogin.phone"
+                      inputmode="tel"
+                      placeholder="+8613800000000"
+                      @keyup.enter="requestTelegramCode"
+                    />
+                  </label>
+                  <label v-if="telegramLogin.step === 'code'">
+                    <span>验证码</span>
+                    <input
+                      v-model="telegramLogin.code"
+                      inputmode="numeric"
+                      placeholder="输入 Telegram 验证码"
+                      @keyup.enter="completeTelegramLogin"
+                    />
+                  </label>
+                </template>
                 <label v-if="telegramLogin.step === 'password'">
                   <span>二步验证密码</span>
                   <input
@@ -247,17 +284,50 @@ export default dashboard;
                   />
                 </label>
               </div>
-              <div class="toolbar compact-toolbar">
-                <button class="btn btn-secondary btn-small" :disabled="telegramLogin.busy" @click="requestTelegramCode">
-                  {{ telegramLogin.busy && telegramLogin.step === 'idle' ? '发送中...' : (telegramLogin.loginId ? '重新发送验证码' : '发送验证码') }}
-                </button>
+              <div class="toolbar compact-toolbar login-flow-toolbar">
+                <template v-if="telegramLogin.method === 'phone'">
+                  <button class="btn btn-secondary btn-small" :disabled="telegramLogin.busy" @click="requestTelegramCode">
+                    {{
+                      telegramLogin.busy && telegramLogin.step === 'idle'
+                        ? '发送中...'
+                        : telegramLogin.loginId
+                          ? '重新发送验证码'
+                          : '发送验证码'
+                    }}
+                  </button>
+                </template>
+                <template v-if="telegramLogin.method === 'qr'">
+                  <button class="btn btn-secondary btn-small" :disabled="telegramLogin.busy" @click="requestTelegramQr">
+                    {{
+                      telegramLogin.busy && telegramLogin.step === 'idle'
+                        ? '生成中...'
+                        : telegramLogin.loginId
+                          ? '重新生成二维码'
+                          : '生成二维码'
+                    }}
+                  </button>
+                  <button
+                    v-if="telegramLogin.loginId && telegramLogin.step === 'qr_wait'"
+                    class="btn btn-secondary btn-small"
+                    :disabled="telegramLogin.busy"
+                    @click="refreshTelegramQr"
+                  >
+                    刷新二维码
+                  </button>
+                </template>
                 <button
                   v-if="telegramLogin.step === 'code' || telegramLogin.step === 'password'"
                   class="btn btn-primary btn-small"
                   :disabled="telegramLogin.busy"
                   @click="completeTelegramLogin"
                 >
-                  {{ telegramLogin.busy ? '提交中...' : (telegramLogin.step === 'password' ? '提交密码' : '完成登录') }}
+                  {{
+                    telegramLogin.busy
+                      ? '提交中...'
+                      : telegramLogin.step === 'password'
+                        ? '提交密码'
+                        : '完成登录'
+                  }}
                 </button>
                 <button
                   v-if="telegramLogin.loginId"

@@ -43,6 +43,9 @@ def translate_error(message: str) -> str:
         "web login proxy port must be an integer": "代理端口格式不正确，请填写数字端口。",
         "web login api_id must be an integer": "API ID 格式不正确，请填写纯数字。",
         "telegram login did not complete": "Telegram 登录没有完成，请重新发送验证码后再试。",
+        "web login session is not a qr flow": "当前会话不是扫码登录流程。",
+        "web login qr cannot refresh while password is required": "当前需要输入二步验证密码，请先提交密码或取消后重新扫码。",
+        "web login qr does not accept phone codes": "扫码登录不需要填写短信验证码，请在手机上确认登录或改用验证码登录。",
     }
     if message in mapping:
         return mapping[message]

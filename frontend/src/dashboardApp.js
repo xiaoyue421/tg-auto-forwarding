@@ -108,12 +108,15 @@ function createSearchState() {
 
 function createTelegramLoginState() {
   return {
+    method: "phone",
     phone: "",
     code: "",
     password: "",
     loginId: "",
     step: "idle",
     busy: false,
+    qrPngBase64: "",
+    qrExpiresAt: "",
   };
 }
 
@@ -227,6 +230,8 @@ export default {
       validation: null,
       logs: [],
       timers: [],
+      /** 扫码登录轮询（独立于服务状态轮询 timers） */
+      telegramQrPollTimer: null,
       modulesList: [],
       modulesLoaded: false,
       modulesFetchError: "",
@@ -505,6 +510,7 @@ export default {
       clearTimeout(this.noticeDismissTimer);
       this.noticeDismissTimer = null;
     }
+    this.stopTelegramQrPoll();
     this.stopPolling();
   },
   methods: {
@@ -993,10 +999,174 @@ export default {
     resetTelegramLogin(options = {}) {
       const preservePhone = Boolean(options.preservePhone);
       const phone = preservePhone ? this.telegramLogin.phone : "";
+      this.stopTelegramQrPoll();
       this.telegramLogin = {
         ...createTelegramLoginState(),
         phone,
       };
+    },
+    stopTelegramQrPoll() {
+      if (this.telegramQrPollTimer != null) {
+        clearInterval(this.telegramQrPollTimer);
+        this.telegramQrPollTimer = null;
+      }
+    },
+    startTelegramQrPoll() {
+      this.stopTelegramQrPoll();
+      this.pollTelegramQrOnce();
+      this.telegramQrPollTimer = window.setInterval(() => this.pollTelegramQrOnce(), 1500);
+    },
+    async pollTelegramQrOnce() {
+      if (
+        !this.telegramLogin.loginId ||
+        this.telegramLogin.method !== "qr" ||
+        this.telegramLogin.step === "password"
+      ) {
+        this.stopTelegramQrPoll();
+        return;
+      }
+      try {
+        const response = await this.fetchJson(
+          `/api/session/qr-status?login_id=${encodeURIComponent(this.telegramLogin.loginId)}`,
+        );
+        const d = response.data || {};
+        const st = d.status;
+        if (st === "waiting") {
+          return;
+        }
+        if (st === "completed") {
+          this.stopTelegramQrPoll();
+          this.config.session_string = d.session_string || "";
+          this.ui.showSessionString = false;
+          this.resetTelegramLogin({ preservePhone: true });
+          try {
+            await this.saveConfig({
+              successMessage: "Telegram 登录成功，session_string 已自动保存到 .env。",
+              throwOnError: true,
+            });
+          } catch (_err) {
+            this.notice = "Telegram 登录成功，但自动保存失败了，请点一次“保存配置”。";
+          }
+          return;
+        }
+        if (st === "password_required") {
+          this.stopTelegramQrPoll();
+          this.telegramLogin = {
+            ...this.telegramLogin,
+            step: "password",
+            password: "",
+            code: "",
+          };
+          this.notice = "该账号开启了两步验证，请在下方输入二步验证密码。";
+          return;
+        }
+        if (st === "expired") {
+          this.stopTelegramQrPoll();
+          this.notice = "二维码已过期，请点击「刷新二维码」后重新扫描。";
+          return;
+        }
+        if (st === "error") {
+          this.stopTelegramQrPoll();
+          this.error = String(d.message || "").trim() || "扫码登录失败。";
+        }
+      } catch (err) {
+        this.stopTelegramQrPoll();
+        this.error = this.normalizeCaughtError(err);
+      }
+    },
+    async setTelegramLoginMethod(method) {
+      const next = method === "qr" ? "qr" : "phone";
+      if (this.telegramLogin.method === next) {
+        return;
+      }
+      if (this.telegramLogin.loginId) {
+        try {
+          await this.fetchJson("/api/session/cancel", {
+            method: "POST",
+            body: JSON.stringify({ login_id: this.telegramLogin.loginId }),
+          });
+        } catch (_err) {
+          /* 忽略 */
+        }
+      }
+      this.stopTelegramQrPoll();
+      const phone = this.telegramLogin.phone;
+      this.telegramLogin = {
+        ...createTelegramLoginState(),
+        phone,
+        method: next,
+      };
+    },
+    async requestTelegramQr() {
+      this.telegramLogin.busy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        if (this.telegramLogin.loginId) {
+          await this.fetchJson("/api/session/cancel", {
+            method: "POST",
+            body: JSON.stringify({ login_id: this.telegramLogin.loginId }),
+          });
+        }
+        const response = await this.fetchJson("/api/session/request-qr", {
+          method: "POST",
+          body: JSON.stringify({
+            api_id: this.config.api_id,
+            api_hash: this.config.api_hash,
+            proxy_type: this.config.proxy_type,
+            proxy_host: this.config.proxy_host,
+            proxy_port: this.config.proxy_port,
+            proxy_user: this.config.proxy_user,
+            proxy_password: this.config.proxy_password,
+            proxy_rdns: this.config.proxy_rdns,
+          }),
+        });
+        const data = response.data || {};
+        this.telegramLogin = {
+          ...this.telegramLogin,
+          code: "",
+          password: "",
+          loginId: data.login_id || "",
+          qrPngBase64: data.qr_png_base64 || "",
+          qrExpiresAt: data.expires_at || "",
+          step: "qr_wait",
+        };
+        this.notice = response.message;
+        this.startTelegramQrPoll();
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.telegramLogin.busy = false;
+      }
+    },
+    async refreshTelegramQr() {
+      if (!this.telegramLogin.loginId || this.telegramLogin.method !== "qr") {
+        return;
+      }
+      this.telegramLogin.busy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/session/qr-refresh", {
+          method: "POST",
+          body: JSON.stringify({ login_id: this.telegramLogin.loginId }),
+        });
+        const data = response.data || {};
+        this.telegramLogin = {
+          ...this.telegramLogin,
+          qrPngBase64: data.qr_png_base64 || "",
+          qrExpiresAt: data.expires_at || "",
+          step: "qr_wait",
+          password: "",
+          code: "",
+        };
+        this.notice = response.message;
+        this.startTelegramQrPoll();
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.telegramLogin.busy = false;
+      }
     },
     applyConfigPayload(payload) {
       this.defaultStartupNotifyMessage = String(payload.data?.defaultStartupNotifyMessage || "");
@@ -1648,6 +1818,7 @@ export default {
       await this.runQueueAction("clear-success-history", { rule_name: ruleName });
     },
     async requestTelegramCode() {
+      this.stopTelegramQrPoll();
       this.telegramLogin.busy = true;
       this.notice = "";
       this.error = "";
@@ -1674,10 +1845,13 @@ export default {
         });
         this.telegramLogin = {
           ...this.telegramLogin,
+          method: "phone",
           code: "",
           password: "",
           loginId: response.data.login_id || "",
           step: "code",
+          qrPngBase64: "",
+          qrExpiresAt: "",
         };
         this.notice = response.message;
       } catch (err) {
@@ -1688,7 +1862,8 @@ export default {
     },
     async completeTelegramLogin() {
       if (!this.telegramLogin.loginId) {
-        this.error = "请先发送验证码。";
+        this.error =
+          this.telegramLogin.method === "qr" ? "请先生成二维码。" : "请先发送验证码。";
         return;
       }
       this.telegramLogin.busy = true;
@@ -1714,6 +1889,7 @@ export default {
           return;
         }
 
+        this.stopTelegramQrPoll();
         this.config.session_string = response.data.session_string || "";
         this.ui.showSessionString = false;
         this.resetTelegramLogin({ preservePhone: true });
@@ -1732,6 +1908,7 @@ export default {
       }
     },
     async cancelTelegramLogin() {
+      this.stopTelegramQrPoll();
       const previousPhone = this.telegramLogin.phone;
       this.telegramLogin.busy = true;
       this.notice = "";

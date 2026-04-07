@@ -1584,3 +1584,41 @@ main.is-dashboard .hdhive-secrets-collapsed .panel-subtext {
 main.is-dashboard .hdhive-secret-toolbar {
   margin-bottom: 0.15rem;
 }
+
+/* Telegram 网页登录：验证码 / 扫码切换 */
+main.is-dashboard .login-method-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+main.is-dashboard .telegram-qr-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 16px;
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px dashed rgba(99, 102, 241, 0.35);
+}
+
+main.is-dashboard .telegram-qr-img {
+  display: block;
+  border-radius: 10px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.08);
+}
+
+main.is-dashboard .qr-expires-hint {
+  margin: 0;
+  font-size: 12px;
+  color: #71717a;
+  text-align: center;
+  max-width: 280px;
+}
+
+main.is-dashboard .login-flow-toolbar {
+  flex-wrap: wrap;
+}

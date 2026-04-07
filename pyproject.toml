@@ -9,6 +9,7 @@ description = "Telegram forwarding dashboard with multi-rule filtering, account/
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "segno>=1.6.0,<2.0.0",
   "Telethon>=1.42.0,<2.0.0",
   "PyYAML>=6.0.2,<7.0.0",
   "python-dotenv>=1.0.1,<2.0.0",

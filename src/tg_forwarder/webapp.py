@@ -136,6 +136,19 @@ class SessionRequestCodePayload(BaseModel):
     proxy_rdns: bool = True
 
 
+class SessionRequestQrPayload(BaseModel):
+    """Same proxy fields as request-code; no phone — login is completed by scanning the QR in Telegram."""
+
+    api_id: str = ""
+    api_hash: str = ""
+    proxy_type: str = "socks5"
+    proxy_host: str = ""
+    proxy_port: str = ""
+    proxy_user: str = ""
+    proxy_password: str = ""
+    proxy_rdns: bool = True
+
+
 class SessionCompletePayload(BaseModel):
     login_id: str = ""
     code: str = ""
@@ -531,6 +544,50 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         ensure_authenticated(request)
         await login_manager.cancel(payload.login_id)
         return ApiResponse(message="已取消当前网页登录流程。")
+
+    @app.post("/api/session/request-qr")
+    async def request_session_qr(request: Request, payload: SessionRequestQrPayload) -> ApiResponse:
+        ensure_authenticated(request)
+        try:
+            result = await login_manager.request_qr(
+                api_id=payload.api_id,
+                api_hash=payload.api_hash,
+                proxy_pool=build_login_proxy_pool(payload),
+            )
+            return ApiResponse(
+                message="二维码已生成。请用手机 Telegram：设置 → 设备 → 链接桌面设备，扫描网页上的二维码。",
+                data=result,
+            )
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
+        except ApiIdInvalidError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="API ID 或 API HASH 不正确，请检查后重试。",
+            ) from exc
+        except FloodWaitError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"请求过于频繁，请等待 {exc.seconds} 秒后再试。",
+            ) from exc
+
+    @app.get("/api/session/qr-status")
+    async def session_qr_status(request: Request, login_id: str = Query("")) -> ApiResponse:
+        ensure_authenticated(request)
+        try:
+            result = await login_manager.qr_status(login_id)
+            return ApiResponse(data=result)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
+
+    @app.post("/api/session/qr-refresh")
+    async def refresh_session_qr(request: Request, payload: SessionCancelPayload) -> ApiResponse:
+        ensure_authenticated(request)
+        try:
+            result = await login_manager.refresh_qr(payload.login_id)
+            return ApiResponse(message="已刷新二维码，请在手机上重新扫描。", data=result)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
 
     @app.get("/api/modules")
     def list_modules(request: Request) -> ApiResponse:
@@ -1335,7 +1392,9 @@ def format_float(value: float) -> str:
     return format(float(value), "g")
 
 
-def build_login_proxy_pool(payload: SessionRequestCodePayload) -> list[ProxyConfig]:
+def build_login_proxy_pool(
+    payload: SessionRequestCodePayload | SessionRequestQrPayload,
+) -> list[ProxyConfig]:
     proxy_host = payload.proxy_host.strip()
     proxy_port = payload.proxy_port.strip()
     if not proxy_host and not proxy_port:
