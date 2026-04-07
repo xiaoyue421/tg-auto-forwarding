@@ -1,0 +1,110 @@
+# =============================================================================
+# TelegramForwarder — Docker Compose 说明（请先看本文件顶部）
+# =============================================================================
+#
+# 【no service selected 是什么】
+#   若两个服务都写了 profiles，且环境变量 COMPOSE_PROFILES 未设置，Compose 不会起任何容器。
+#   本文件已改为：生产服务无 profile，直接 `docker compose up -d` 即可，无需再配 COMPOSE_PROFILES。
+#
+# 【这个文件做什么】
+#   用同一套镜像（根目录 Dockerfile）启动 Web 控制台；生产服务主机端口固定映射 8810 → 容器 8080。
+#   队列 SQLite 等在命名卷 tg_forwarder_data（容器内 /data）。
+#
+# 【两个服务怎么分工】
+#   • tg-forwarder — 生产（默认总启动）
+#       - 镜像内代码 + 前端；挂 ./.env（须可写，控制台「保存配置」会改 .env）与数据卷；改代码需重新 build。
+#
+#   • tg-forwarder-dev — 开发（仅当启用 profile「true」时启动）
+#       - 挂载整个 ./ 到 /workspace；入口脚本会在缺 assets 时用镜像内前端补全 static/。
+#       - 主机端口默认 8081，避免与生产 8080 同时开时冲突。
+#       - 注意：不要长期同时跑生产 + 开发两个容器连同一 Telegram 账号，易重复监听/冲突。
+#
+# 【开发模式怎么开】
+#   在项目根目录任选其一：
+#       COMPOSE_PROFILES=true docker compose up -d --build
+#   或把 COMPOSE_PROFILES=true 写进 .env（与 Telegram 配置同文件即可）。
+#   建议先停生产再只起开发（避免双实例）：
+#       docker compose stop tg-forwarder
+#       COMPOSE_PROFILES=true docker compose up -d --build
+#   恢复生产：
+#       docker compose stop tg-forwarder-dev
+#       docker compose up -d
+#
+# 【常用命令】
+#       docker compose up -d --build
+#       docker compose logs -f
+#       docker compose down
+#
+# 【可选：国内 pip 镜像】构建参数见各 build.args，在 .env 中可设 PIP_INDEX_URL 等。
+#
+# =============================================================================
+
+name: tg-forwarder
+
+x-tg-forwarder-common: &tg-forwarder-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      PYTHON_BASE_IMAGE: ${PYTHON_BASE_IMAGE:-python:3.12-slim}
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+      PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+  image: tg-forwarder:local
+  restart: unless-stopped
+  working_dir: /workspace
+  environment:
+    TZ: Asia/Shanghai
+    PYTHONUNBUFFERED: "1"
+    PYTHONPATH: /workspace/src
+    TG_QUEUE_DB_PATH: /data/tg_forwarder_queue.sqlite3
+    TG_BOT_START_RETRIES_PER_PROXY: "5"
+    TG_BOT_POOL_START_STAGGER_SECONDS: "4"
+    # 网页导入模块写入此目录（映射到宿主机 ./scripts）
+    TG_MODULES_PATH: /workspace/scripts
+  ports:
+    - "8810:8080"
+  command:
+    - python
+    - -m
+    - tg_forwarder
+    - web
+    - --config
+    - /workspace/.env
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8080"
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3).read()
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
+services:
+  # 生产：无 profiles，docker compose up 默认只起本服务
+  tg-forwarder:
+    <<: *tg-forwarder-common
+    container_name: tg-forwarder
+    volumes:
+      - ./data:/data
+      # 不要用 :ro —— 网页「保存配置」需要写回 .env
+      - ./.env:/workspace/.env
+      - ./scripts:/workspace/scripts
+
+  # 开发：需 COMPOSE_PROFILES=true（或 --profile true）
+  tg-forwarder-dev:
+    <<: *tg-forwarder-common
+    profiles:
+      - "true"
+    container_name: tg-forwarder-dev
+    ports:
+      - "${TG_DASHBOARD_DEV_PORT:-8081}:8080"
+    volumes:
+      - ./data:/data
+      - ./:/workspace
+      - ./scripts:/workspace/scripts

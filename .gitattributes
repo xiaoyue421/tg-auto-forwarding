@@ -1,0 +1,2 @@
+# Shell entrypoints must use LF so Linux containers can exec them (CRLF breaks shebang).
+*.sh text eol=lf
