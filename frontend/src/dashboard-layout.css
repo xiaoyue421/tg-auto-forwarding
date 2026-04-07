@@ -1165,7 +1165,7 @@ main.is-dashboard .btn-accent {
 
 @media (max-width: 899px) {
   :root {
-    --mobile-dash-header-height: 64px;
+    --mobile-dash-header-height: 98px;
   }
 
   .dashboard-app {
@@ -1178,7 +1178,7 @@ main.is-dashboard .btn-accent {
     display: block;
     position: fixed;
     inset: 0;
-    z-index: 190;
+    z-index: 230;
     background: rgba(9, 9, 11, 0.42);
     backdrop-filter: blur(4px);
     opacity: 0;
@@ -1202,7 +1202,7 @@ main.is-dashboard .btn-accent {
     left: 0;
     width: min(288px, 88vw);
     max-width: 300px;
-    z-index: 200;
+    z-index: 240;
     min-height: 0;
     height: 100vh;
     height: 100dvh;
@@ -1225,12 +1225,15 @@ main.is-dashboard .btn-accent {
 
   .mobile-menu-btn {
     display: inline-flex;
+    position: fixed;
+    top: calc(10px + env(safe-area-inset-top, 0px));
+    right: 16px;
+    z-index: 260;
   }
 
   /* 抽屉打开时遮罩盖住主区，需让汉堡仍在上层以便再次点击收起 */
   .dashboard-app.is-mobile-nav-open .mobile-menu-btn {
-    position: relative;
-    z-index: 210;
+    z-index: 260;
   }
 
   .dashboard-main {
@@ -1241,7 +1244,7 @@ main.is-dashboard .btn-accent {
     overflow-y: auto;
     -webkit-overflow-scrolling: touch;
     /* 为固定顶栏预留空间，避免滚动内容顶端被遮挡 */
-    padding-top: calc(var(--mobile-dash-header-height) + env(safe-area-inset-top, 0px));
+    padding-top: calc(var(--mobile-dash-header-height) + env(safe-area-inset-top, 0px) + 8px);
   }
 
   .dash-header {
@@ -1251,7 +1254,7 @@ main.is-dashboard .btn-accent {
     top: 0;
     z-index: 220;
     height: calc(var(--mobile-dash-header-height) + env(safe-area-inset-top, 0px));
-    padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 12px;
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 14px;
     flex-wrap: nowrap;
     justify-content: space-between;
     align-items: flex-start;
@@ -1263,6 +1266,7 @@ main.is-dashboard .btn-accent {
   .dash-header-main {
     flex: 1 1 auto;
     min-width: 0;
+    overflow: hidden;
   }
 
   /* 手机上保留「当前分区」提示，增强当前位置感 */
@@ -1279,12 +1283,12 @@ main.is-dashboard .btn-accent {
   }
 
   .dash-title {
-    font-size: 28px;
-    line-height: 1.15;
+    font-size: 34px;
+    line-height: 1.08;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    max-width: 72vw;
+    max-width: 74vw;
   }
 
   /* 小屏隐藏顶栏三张统计卡（规则 / 已启用 / Worker），侧栏里可看服务与队列概况 */
