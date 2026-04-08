@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,11 +51,12 @@ from tg_forwarder.dispatch_queue import (
     list_dispatch_success_history_rules,
     list_failed_dispatch_jobs,
     resolve_queue_db_path,
-    retry_failed_dispatch_jobs,
+    retry_failed_dispatch_jobs_smart,
 )
 from tg_forwarder.env_utils import read_env_file, update_env_file
 from tg_forwarder.hdhive_checkin import (
     hdhive_checkin_loop,
+    load_checkin_state_for_env,
     normalize_hdhive_checkin_method,
     resolve_hdhive_proxy,
     run_hdhive_checkin,
@@ -83,6 +85,7 @@ from tg_forwarder.web_login import TelegramWebLoginManager
 DEFAULT_DASHBOARD_PASSWORD = "admin"
 LIST_SPLIT_PATTERN = re.compile(r"[,;\r\n]+")
 MODULE_CONFIG_JSON_MAX_BYTES = 256 * 1024
+_SENSITIVE_ENV_HINTS = ("PASSWORD", "TOKEN", "SECRET", "KEY", "COOKIE", "HASH", "SESSION")
 
 
 def _log_hdhive_event(event_label: str, method: str, status: int, msg: str, desc: str) -> None:
@@ -98,6 +101,27 @@ def _log_hdhive_event(event_label: str, method: str, status: int, msg: str, desc
         log.info(text)
     else:
         log.warning(text)
+
+
+def _mask_sensitive_value(value: str) -> str:
+    s = str(value or "")
+    if not s:
+        return ""
+    if len(s) <= 8:
+        return "***"
+    return f"{s[:3]}***{s[-3:]}"
+
+
+def _build_sanitized_env_snapshot(values: dict[str, str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, value in values.items():
+        k = str(key or "").strip()
+        v = str(value or "")
+        if any(hint in k.upper() for hint in _SENSITIVE_ENV_HINTS):
+            out[k] = _mask_sensitive_value(v)
+        else:
+            out[k] = v
+    return out
 
 
 class LoginPayload(BaseModel):
@@ -162,6 +186,8 @@ class SessionCancelPayload(BaseModel):
 class RulePayload(BaseModel):
     name: str = ""
     enabled: bool = True
+    group: str = ""
+    priority: int = 100
     source_chat: str = ""
     target_chats: str = ""
     bot_target_chats: str = ""
@@ -199,6 +225,15 @@ class RulePayload(BaseModel):
     def validate_regex_text(cls, value: str, info: object) -> str:
         field_name = getattr(info, "field_name", "regex")
         return normalize_regex_text(value, field_name)
+
+    @field_validator("priority")
+    @classmethod
+    def validate_priority(cls, value: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 100
+        return max(1, min(10_000, parsed))
 
 
 class DashboardConfigPayload(BaseModel):
@@ -247,6 +282,28 @@ class DashboardConfigPayload(BaseModel):
     @classmethod
     def validate_search_default_mode(cls, value: str) -> str:
         return normalize_search_mode(value, "search_default_mode")
+
+
+def _validate_hdhive_checkin_config(payload: DashboardConfigPayload) -> None:
+    method = normalize_hdhive_checkin_method(payload.hdhive_checkin_method)
+    if not payload.hdhive_checkin_enabled:
+        return
+    if method == "cookie":
+        missing: list[str] = []
+        if not payload.hdhive_cookie.strip():
+            missing.append("Cookie")
+        if not payload.hdhive_next_action.strip():
+            missing.append("Next-Action")
+        if not payload.hdhive_next_router_state_tree.strip():
+            missing.append("Next-Router-State-Tree")
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"自动签到已开启，Cookie 模式缺少：{', '.join(missing)}。",
+            )
+        return
+    if not payload.hdhive_api_key.strip():
+        raise HTTPException(status_code=400, detail="自动签到已开启，API Key 模式需填写 HDHive API Key。")
 
 
 class SearchPayload(BaseModel):
@@ -784,6 +841,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     def persist_dashboard_config(request: Request, payload: DashboardConfigPayload) -> ApiResponse:
         ensure_authenticated(request)
         ensure_env_config_path(resolved_config_path)
+        _validate_hdhive_checkin_config(payload)
         normalized_rules = payload.rules or [build_default_rule(1)]
         first_rule = normalized_rules[0]
         rules_json = serialize_rules_to_json(normalized_rules)
@@ -880,6 +938,70 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
 
+    def _hdhive_checkin_health(values: dict[str, str]) -> dict[str, Any]:
+        method = normalize_hdhive_checkin_method(values.get("HDHIVE_CHECKIN_METHOD"))
+        enabled = parse_bool_string(values.get("HDHIVE_CHECKIN_ENABLED"))
+        state = load_checkin_state_for_env(resolved_config_path)
+        proxy, proxy_err = resolve_hdhive_proxy(values)
+        return {
+            "enabled": enabled,
+            "method": method,
+            "using_proxy": proxy is not None,
+            "proxy_error": proxy_err or "",
+            "last_success_date": str(state.get("last_success_date") or ""),
+            "last_http_status": state.get("last_http_status"),
+            "last_attempt_epoch": state.get("last_attempt_epoch"),
+            "next_retry_epoch": state.get("next_retry_epoch"),
+            "attempt_count_today": int(state.get("attempt_count_today") or 0),
+            "retry_exhausted_date": str(state.get("retry_exhausted_date") or ""),
+        }
+
+    @app.get("/api/health")
+    def get_health(request: Request) -> ApiResponse:
+        ensure_authenticated(request)
+        values = read_env_file(resolved_config_path)
+        runtime_state = service.get_state()
+        failed_has_items = bool(list_failed_dispatch_jobs(queue_db_path(), limit=1))
+        success_total = count_dispatch_success_history(queue_db_path())
+        return ApiResponse(
+            data={
+                "service": runtime_state.as_dict(),
+                "logs": {
+                    "in_memory_total": log_handler.total_record_count(),
+                    "capacity": getattr(log_handler, "capacity", None),
+                },
+                "queue": {
+                    "failed_has_items": failed_has_items,
+                    "success_history_total": success_total,
+                },
+                "hdhive_checkin": _hdhive_checkin_health(values),
+            }
+        )
+
+    @app.get("/api/v1/health")
+    def get_health_v1(request: Request) -> ApiResponse:
+        return get_health(request)
+
+    @app.get("/api/diagnostics/export")
+    def export_diagnostics(request: Request) -> ApiResponse:
+        ensure_authenticated(request)
+        values = read_env_file(resolved_config_path)
+        health_payload = get_health(request).data
+        failed_items = [asdict(item) for item in list_failed_dispatch_jobs(queue_db_path(), limit=30)]
+        logs = log_handler.list_records(limit=300)
+        now = datetime.now(timezone.utc)
+        diagnostics = {
+            "schema": "tg-forwarder.diagnostics.v1",
+            "generated_at": now.isoformat(),
+            "config_path": str(resolved_config_path),
+            "env_sanitized": _build_sanitized_env_snapshot(values),
+            "health": health_payload,
+            "failed_queue_samples": failed_items,
+            "recent_logs": logs,
+        }
+        filename = f"tg-forwarder-diagnostics-{now.strftime('%Y%m%d-%H%M%S')}.json"
+        return ApiResponse(message="诊断包已生成。", data={"filename": filename, "diagnostics": diagnostics})
+
     @app.get("/api/status")
     def get_status(request: Request) -> ApiResponse:
         ensure_authenticated(request)
@@ -897,10 +1019,23 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     @app.post("/api/queue/retry-failed")
     def retry_failed_queue_items(request: Request) -> ApiResponse:
         ensure_authenticated(request)
-        retried_count = retry_failed_dispatch_jobs(queue_db_path())
+        retry_result = retry_failed_dispatch_jobs_smart(queue_db_path())
+        retried_count = retry_result.retried_count
+        skipped_non_retryable = retry_result.skipped_non_retryable
+        skipped_cooldown = retry_result.skipped_cooldown
+        message = f"已重新放回队列 {retried_count} 个失败目标。"
+        if skipped_non_retryable or skipped_cooldown:
+            message += (
+                f"（跳过不可重试 {skipped_non_retryable} 条，"
+                f"冷却中 {skipped_cooldown} 条）"
+            )
         return ApiResponse(
-            message=f"已重新放回队列 {retried_count} 个失败目标。",
-            data={"retried_count": retried_count},
+            message=message,
+            data={
+                "retried_count": retried_count,
+                "skipped_non_retryable": skipped_non_retryable,
+                "skipped_cooldown": skipped_cooldown,
+            },
         )
 
     @app.post("/api/queue/clear-failed")
@@ -1183,7 +1318,7 @@ def build_log_handler() -> InMemoryLogHandler:
 
 
 def build_default_rule(index: int) -> RulePayload:
-    return RulePayload(name=f"rule_{index}")
+    return RulePayload(name=f"rule_{index}", priority=index)
 
 
 def load_rule_payloads(values: dict[str, str]) -> list[RulePayload]:
@@ -1197,14 +1332,17 @@ def load_rule_payloads(values: dict[str, str]) -> list[RulePayload]:
             raise ConfigError("TG_RULES_JSON must be a JSON array")
         if not stored_rules:
             return [build_default_rule(1)]
-        return [rule_payload_from_dict(item, index) for index, item in enumerate(stored_rules, start=1)]
-    return [build_legacy_rule(values)]
+        parsed_rules = [rule_payload_from_dict(item, index) for index, item in enumerate(stored_rules, start=1)]
+        return sort_rule_payloads(parsed_rules)
+    return sort_rule_payloads([build_legacy_rule(values)])
 
 
 def build_legacy_rule(values: dict[str, str]) -> RulePayload:
     return RulePayload(
         name=(values.get("TG_WORKER_NAME", "") or "").strip() or "rule_1",
         enabled=True,
+        group="default",
+        priority=100,
         source_chat=(values.get("TG_SOURCE_CHAT", "") or "").strip(),
         target_chats=((values.get("TG_TARGET_CHATS") or values.get("TG_TARGET_CHAT") or "").strip()),
         bot_target_chats=(values.get("TG_BOT_TARGET_CHATS", "") or "").strip(),
@@ -1228,6 +1366,17 @@ def build_legacy_rule(values: dict[str, str]) -> RulePayload:
     )
 
 
+def sort_rule_payloads(rules: list[RulePayload]) -> list[RulePayload]:
+    return sorted(
+        rules,
+        key=lambda rule: (
+            int(getattr(rule, "priority", 100) or 100),
+            str(getattr(rule, "group", "") or "").strip().lower(),
+            str(getattr(rule, "name", "") or "").strip().lower(),
+        ),
+    )
+
+
 def rule_payload_from_dict(raw_rule: object, index: int) -> RulePayload:
     if not isinstance(raw_rule, dict):
         raise ConfigError(f"TG_RULES_JSON[{index}] must be an object")
@@ -1239,10 +1388,16 @@ def rule_payload_from_dict(raw_rule: object, index: int) -> RulePayload:
     source_chat = sources_to_text(raw_rule.get("sources", raw_rule.get("source")))
     targets = targets_to_text(raw_rule.get("targets"))
     name = str(raw_rule.get("name") or f"rule_{index}").strip() or f"rule_{index}"
+    try:
+        priority = int(raw_rule.get("priority") or index)
+    except (TypeError, ValueError):
+        priority = index
 
     return RulePayload(
         name=name,
         enabled=bool(raw_rule.get("enabled", True)),
+        group=str(raw_rule.get("group") or "").strip(),
+        priority=priority,
         source_chat=source_chat,
         target_chats=targets,
         bot_target_chats=targets_to_text(raw_rule.get("bot_targets")),
@@ -1342,6 +1497,8 @@ def serialize_rules_to_json(rules: list[RulePayload]) -> str:
         item: dict[str, object] = {
             "name": rule.name.strip() or f"rule_{index}",
             "enabled": bool(rule.enabled),
+            "group": str(rule.group or "").strip(),
+            "priority": int(rule.priority or index),
             "sources": source_values,
             "targets": split_list_value(rule.target_chats),
             "bot_targets": split_list_value(rule.bot_target_chats),

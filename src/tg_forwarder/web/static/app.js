@@ -4,6 +4,8 @@ function createRule(name = "rule_1") {
   return {
     name,
     enabled: true,
+    group: "default",
+    priority: 100,
     source_chat: "",
     target_chats: "",
     bot_target_chats: "",
@@ -212,6 +214,12 @@ createApp({
         last_error: null,
         snapshot: null,
       },
+      health: {
+        service: null,
+        logs: null,
+        queue: null,
+        hdhive_checkin: null,
+      },
       queue: {
         failedItems: [],
         actionBusy: false,
@@ -225,6 +233,8 @@ createApp({
       ui: {
         activeTab: "rules",
         expandedRuleIndex: 0,
+        collapsedRuleGroups: {},
+        ruleGroupFilter: "all",
         showSessionString: false,
         showBotToken: false,
         logFilter: "monitor",
@@ -304,6 +314,34 @@ createApp({
     successHistoryRules() {
       return this.queue.successHistoryRules || [];
     },
+    ruleGroups() {
+      const groups = new Set();
+      for (const rule of this.config.rules || []) {
+        const key = String(rule.group || "").trim() || "default";
+        groups.add(key);
+      }
+      return Array.from(groups.values()).sort((a, b) => a.localeCompare(b, "zh-CN"));
+    },
+    groupedRuleBuckets() {
+      const groups = new Map();
+      for (const rule of this.config.rules || []) {
+        const g = String(rule.group || "").trim() || "default";
+        if (!groups.has(g)) {
+          groups.set(g, []);
+        }
+        groups.get(g).push(rule);
+      }
+      return Array.from(groups.entries())
+        .sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))
+        .map(([group, rules]) => ({ group, rules }));
+    },
+    filteredGroupedRuleBuckets() {
+      const selected = String(this.ui.ruleGroupFilter || "all").trim() || "all";
+      if (selected === "all") {
+        return this.groupedRuleBuckets;
+      }
+      return this.groupedRuleBuckets.filter((bucket) => bucket.group === selected);
+    },
     selectedSuccessHistoryRule() {
       return (
         this.successHistoryRules.find(
@@ -329,6 +367,22 @@ createApp({
         return "\u81ea\u52a8\u6d88\u606f\u4f1a\u5148\u8fdb\u5165\u53d1\u9001\u961f\u5217\uff0c\u76ee\u524d\u672a\u5f00\u542f\u989d\u5916\u9650\u6d41";
       }
       return `\u81ea\u52a8\u6d88\u606f\u4f1a\u5148\u8fdb\u5165\u53d1\u9001\u961f\u5217\uff0c\u5df2\u5f00\u542f\u9650\u6d41\uff0c\u95f4\u9694 ${this.formatSeconds(this.statusRateLimitDelaySeconds)}`;
+    },
+    healthCheckin() {
+      return this.health?.hdhive_checkin || null;
+    },
+    healthCheckinEnabled() {
+      return Boolean(this.healthCheckin?.enabled);
+    },
+    healthCheckinMethodLabel() {
+      return String(this.healthCheckin?.method || "") === "cookie" ? "Cookie 模式" : "API Key 模式";
+    },
+    healthCheckinNextRetryText() {
+      const epoch = Number(this.healthCheckin?.next_retry_epoch || 0);
+      if (!epoch) {
+        return "-";
+      }
+      return this.formatDateTime(epoch);
     },
     ruleCount() {
       return this.config.rules.length;
@@ -547,6 +601,8 @@ createApp({
         ...createRule(`rule_${index + 1}`),
         ...rule,
         name: (rule.name || `rule_${index + 1}`).trim(),
+        group: String(rule.group || "default").trim() || "default",
+        priority: Math.max(1, Number.parseInt(rule.priority, 10) || index + 1),
         forward_strategy: String(rule.forward_strategy || "inherit").trim() || "inherit",
         regex_any: this.normalizeMultilineText(rule.regex_any || ""),
         regex_all: this.normalizeMultilineText(rule.regex_all || ""),
@@ -763,15 +819,88 @@ createApp({
       const filterCount = this.countRuleFilters(rule);
       return [
         rule.source_chat || "未设置源",
+        `分组 ${String(rule.group || "default").trim() || "default"}`,
+        `优先级 ${Math.max(1, Number.parseInt(rule.priority, 10) || 1)}`,
         `账号目标 ${targetCount}`,
         `Bot 目标 ${botTargetCount}`,
         this.getRuleForwardStrategyLabel(rule.forward_strategy || "inherit"),
         `过滤 ${filterCount}`,
       ].join(" · ");
     },
-    addRule() {
+    _normalizeRulePriority(rule, fallback = 1) {
+      const parsed = Number.parseInt(rule.priority, 10);
+      rule.priority = Math.max(1, parsed || fallback);
+    },
+    ruleIndex(rule) {
+      return this.config.rules.indexOf(rule);
+    },
+    isGroupCollapsed(groupName) {
+      const key = String(groupName || "").trim() || "default";
+      return Boolean(this.ui.collapsedRuleGroups?.[key]);
+    },
+    toggleGroupCollapsed(groupName) {
+      const key = String(groupName || "").trim() || "default";
+      this.ui.collapsedRuleGroups = {
+        ...(this.ui.collapsedRuleGroups || {}),
+        [key]: !this.isGroupCollapsed(key),
+      };
+    },
+    sortGroupByPriority(groupName) {
+      const key = String(groupName || "").trim() || "default";
+      const inGroup = [];
+      const outGroup = [];
+      for (const rule of this.config.rules) {
+        const g = String(rule.group || "").trim() || "default";
+        if (g === key) {
+          inGroup.push(rule);
+        } else {
+          outGroup.push(rule);
+        }
+      }
+      inGroup.sort((a, b) => {
+        const pa = Math.max(1, Number.parseInt(a.priority, 10) || 1);
+        const pb = Math.max(1, Number.parseInt(b.priority, 10) || 1);
+        if (pa !== pb) return pa - pb;
+        return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
+      });
+      this.config.rules = [...outGroup, ...inGroup];
+    },
+    moveRule(index, direction) {
+      const target = index + direction;
+      if (target < 0 || target >= this.config.rules.length) {
+        return;
+      }
+      const current = this.config.rules[index];
+      this.config.rules.splice(index, 1);
+      this.config.rules.splice(target, 0, current);
+      if (this.ui.expandedRuleIndex === index) {
+        this.ui.expandedRuleIndex = target;
+      } else if (this.ui.expandedRuleIndex === target) {
+        this.ui.expandedRuleIndex = index;
+      }
+    },
+    toggleGroupEnabled(groupName, enabled) {
+      const g = String(groupName || "").trim() || "default";
+      this.config.rules = this.config.rules.map((rule) => {
+        const rg = String(rule.group || "").trim() || "default";
+        if (rg !== g) {
+          return rule;
+        }
+        return { ...rule, enabled };
+      });
+    },
+    setRuleGroupFilter(groupName) {
+      const selected = String(groupName || "all").trim() || "all";
+      this.ui.ruleGroupFilter = selected;
+    },
+    addRule(groupName = "") {
       const index = this.config.rules.length;
-      this.config.rules.push(createRule(this.nextRuleName()));
+      const next = createRule(this.nextRuleName());
+      const g = String(groupName || "").trim();
+      if (g) {
+        next.group = g;
+      }
+      this.config.rules.push(next);
       this.expandRule(index);
     },
     duplicateRule(index) {
@@ -858,6 +987,12 @@ createApp({
         last_error: null,
         snapshot: null,
       };
+      this.health = {
+        service: null,
+        logs: null,
+        queue: null,
+        hdhive_checkin: null,
+      };
       this.queue = {
         failedItems: [],
         actionBusy: false,
@@ -875,6 +1010,7 @@ createApp({
         await Promise.all([
           this.fetchConfig(),
           this.fetchStatus(),
+          this.fetchHealth(),
           this.fetchLogs(),
           this.fetchFailedQueue({ silent: true }),
           this.fetchSuccessHistorySummary({ silent: true }),
@@ -886,6 +1022,7 @@ createApp({
     startPolling() {
       this.stopPolling();
       this.timers.push(setInterval(() => this.fetchStatus({ silent: true }), 1000));
+      this.timers.push(setInterval(() => this.fetchHealth({ silent: true }), 2500));
       this.timers.push(setInterval(() => this.fetchLogs({ silent: true }), 1200));
       this.timers.push(setInterval(() => this.fetchFailedQueue({ silent: true }), 3000));
       this.timers.push(setInterval(() => this.fetchSuccessHistorySummary({ silent: true }), 4000));
@@ -909,6 +1046,17 @@ createApp({
       try {
         const response = await this.fetchJson("/api/status");
         this.status = response.data;
+      } catch (err) {
+        if (!silent) {
+          this.error = this.normalizeCaughtError(err);
+        }
+      }
+    },
+    async fetchHealth(options = {}) {
+      const silent = Boolean(options.silent);
+      try {
+        const response = await this.fetchJson("/api/health");
+        this.health = response.data || {};
       } catch (err) {
         if (!silent) {
           this.error = this.normalizeCaughtError(err);
@@ -1014,6 +1162,7 @@ createApp({
         this.status = response.data;
         this.notice = response.message;
         await this.fetchStatus({ silent: true });
+        await this.fetchHealth({ silent: true });
         await this.fetchLogs({ silent: true });
         await this.fetchFailedQueue({ silent: true });
         await this.fetchSuccessHistorySummary({ silent: true });
@@ -1035,6 +1184,7 @@ createApp({
         this.notice = response.message;
         await Promise.all([
           this.fetchStatus({ silent: true }),
+          this.fetchHealth({ silent: true }),
           this.fetchLogs({ silent: true }),
           this.fetchFailedQueue({ silent: true }),
           this.fetchSuccessHistorySummary({ silent: true }),
@@ -1085,6 +1235,28 @@ createApp({
         return;
       }
       await this.runQueueAction("clear-success-history", { rule_name: ruleName });
+    },
+    async exportDiagnosticsBundle() {
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/diagnostics/export");
+        const diagnostics = response.data?.diagnostics || {};
+        const filename = String(response.data?.filename || "").trim() || "tg-forwarder-diagnostics.json";
+        const blob = new Blob([JSON.stringify(diagnostics, null, 2)], {
+          type: "application/json;charset=utf-8",
+        });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(blob);
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(link.href);
+        this.notice = response.message || "诊断包已导出。";
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      }
     },
     async requestTelegramCode() {
       this.telegramLogin.busy = true;
@@ -1599,33 +1771,79 @@ createApp({
                 <h2>规则设置</h2>
                 <p class="panel-subtext">每条规则只监听一个源。点击卡片头可以展开或收起详细配置，手机上会轻松很多。</p>
               </div>
-              <button class="btn btn-primary btn-small" @click="addRule">新增规则</button>
+              <div class="toolbar compact-toolbar">
+                <button class="btn btn-secondary btn-small" :disabled="!ruleGroups.length" @click="ruleGroups.forEach((g) => toggleGroupEnabled(g, true))">
+                  启用全部分组
+                </button>
+                <button class="btn btn-ghost btn-small" :disabled="!ruleGroups.length" @click="ruleGroups.forEach((g) => toggleGroupEnabled(g, false))">
+                  停用全部分组
+                </button>
+                <select
+                  class="queue-history-select"
+                  v-model="ui.ruleGroupFilter"
+                  @change="setRuleGroupFilter(ui.ruleGroupFilter)"
+                >
+                  <option value="all">显示全部分组</option>
+                  <option v-for="g in ruleGroups" :key="g" :value="g">
+                    仅显示：{{ g }}
+                  </option>
+                </select>
+                <button class="btn btn-primary btn-small" @click="addRule">新增规则</button>
+                <button
+                  class="btn btn-ghost btn-small"
+                  :disabled="ui.ruleGroupFilter === 'all'"
+                  @click="addRule(ui.ruleGroupFilter)"
+                >
+                  在当前分组新增
+                </button>
+              </div>
             </div>
+            <p v-if="ruleGroups.length" class="panel-subtext">
+              当前分组：{{ ruleGroups.join("、") }}
+            </p>
 
             <div class="rule-stack">
-              <article
-                v-for="(rule, index) in config.rules"
-                :key="index"
-                class="rule-card"
-                :data-open="isRuleExpanded(index)"
-              >
-                <button class="rule-overview" @click="toggleRule(index)">
+              <section v-for="bucket in filteredGroupedRuleBuckets" :key="bucket.group" class="subpanel">
+                <div class="panel-head panel-head-wrap compact-head">
+                  <div>
+                    <h3>分组：{{ bucket.group }}</h3>
+                    <p class="panel-subtext">共 {{ bucket.rules.length }} 条规则</p>
+                  </div>
+                  <div class="toolbar compact-toolbar">
+                    <button class="btn btn-secondary btn-small" @click="toggleGroupEnabled(bucket.group, true)">启用本组</button>
+                    <button class="btn btn-ghost btn-small" @click="toggleGroupEnabled(bucket.group, false)">停用本组</button>
+                    <button class="btn btn-ghost btn-small" @click="sortGroupByPriority(bucket.group)">按优先级排序</button>
+                    <button class="btn btn-ghost btn-small" @click="toggleGroupCollapsed(bucket.group)">
+                      {{ isGroupCollapsed(bucket.group) ? '展开分组' : '收起分组' }}
+                    </button>
+                  </div>
+                </div>
+                <article
+                  v-for="rule in bucket.rules"
+                  v-show="!isGroupCollapsed(bucket.group)"
+                  :key="rule.name + ':' + String(rule.source_chat || '') + ':' + String(rule.priority || '')"
+                  class="rule-card"
+                  :data-open="isRuleExpanded(ruleIndex(rule))"
+                >
+                  <button class="rule-overview" @click="toggleRule(ruleIndex(rule))">
                   <div class="rule-overview-main">
                     <div class="rule-title-row">
-                      <strong>{{ rule.name || ('rule_' + (index + 1)) }}</strong>
+                      <strong>{{ rule.name || ('rule_' + (ruleIndex(rule) + 1)) }}</strong>
                       <span class="mini-pill" :data-tone="rule.enabled ? 'good' : 'muted'">
                         {{ rule.enabled ? '已启用' : '已停用' }}
                       </span>
                     </div>
                     <p class="rule-summary">{{ buildRuleSummary(rule) }}</p>
                   </div>
-                  <span class="expand-mark">{{ isRuleExpanded(index) ? '收起' : '展开' }}</span>
+                  <span class="expand-mark">{{ isRuleExpanded(ruleIndex(rule)) ? '收起' : '展开' }}</span>
                 </button>
 
-                <div v-show="isRuleExpanded(index)" class="rule-body">
+                <div v-show="isRuleExpanded(ruleIndex(rule))" class="rule-body">
                   <div class="rule-actions">
-                    <button class="btn btn-ghost btn-small" @click="duplicateRule(index)">复制</button>
-                    <button class="btn btn-ghost btn-small" @click="removeRule(index)">删除</button>
+                    <button class="btn btn-ghost btn-small" :disabled="ruleIndex(rule) === 0" @click="moveRule(ruleIndex(rule), -1)">上移</button>
+                    <button class="btn btn-ghost btn-small" :disabled="ruleIndex(rule) >= config.rules.length - 1" @click="moveRule(ruleIndex(rule), 1)">下移</button>
+                    <button class="btn btn-ghost btn-small" @click="duplicateRule(ruleIndex(rule))">复制</button>
+                    <button class="btn btn-ghost btn-small" @click="removeRule(ruleIndex(rule))">删除</button>
                   </div>
 
                   <div class="form-grid rule-grid">
@@ -1636,6 +1854,14 @@ createApp({
                     <label class="toggle">
                       <input type="checkbox" v-model="rule.enabled" />
                       <span>启用这条规则</span>
+                    </label>
+                    <label>
+                      <span>规则分组</span>
+                      <input v-model="rule.group" placeholder="default / movie / news" />
+                    </label>
+                    <label>
+                      <span>优先级（数字越小越靠前）</span>
+                      <input v-model.number="rule.priority" type="number" min="1" @change="_normalizeRulePriority(rule, ruleIndex(rule) + 1)" />
                     </label>
                     <label>
                       <span>源频道 / 群</span>
@@ -1757,6 +1983,7 @@ createApp({
                   </div>
                 </div>
               </article>
+              </section>
             </div>
           </article>
 
@@ -1881,12 +2108,26 @@ createApp({
                     <p>失败目标：{{ statusGlobalQueueDeliveryFailed }} 个</p>
                     <p>已转发去重历史：{{ queue.successHistoryTotalCount }} 条</p>
                     <p>{{ statusRateLimitText }}</p>
+                    <p>日志缓冲：{{ health.logs?.in_memory_total || 0 }} / {{ health.logs?.capacity || '-' }}</p>
+                    <p>
+                      签到健康：{{ healthCheckinEnabled ? '已开启' : '已关闭' }} · {{ healthCheckinMethodLabel }}
+                      · 最近成功：{{ healthCheckin?.last_success_date || '-' }}
+                    </p>
+                    <p>
+                      签到重试：今日 {{ healthCheckin?.attempt_count_today || 0 }} 次 · 下次计划 {{ healthCheckinNextRetryText }}
+                    </p>
+                    <p v-if="healthCheckin?.proxy_error" class="dispatch-history-note">
+                      签到代理提示：{{ healthCheckin.proxy_error }}
+                    </p>
                     <div class="toolbar compact-toolbar">
                       <button class="btn btn-secondary btn-small" :disabled="queue.actionBusy || !statusGlobalQueueFailed" @click="retryFailedQueue">
                         {{ queue.actionBusy ? '处理中...' : '重试失败任务' }}
                       </button>
                       <button class="btn btn-ghost btn-small" :disabled="queue.actionBusy || !statusGlobalQueueFailed" @click="clearFailedQueue">
                         清空失败任务
+                      </button>
+                      <button class="btn btn-ghost btn-small" :disabled="actionBusy || loading" @click="exportDiagnosticsBundle">
+                        导出诊断包
                       </button>
                     </div>
                     <div class="toolbar compact-toolbar">

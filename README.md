@@ -15,6 +15,11 @@
 - 支持“需要媒体”和“需要文本内容”组合判断
 - 支持历史消息搜索后手动指定转发
 - 支持本地发送队列、失败重试、成功历史去重
+- 支持失败任务智能重试（自动跳过不可重试错误、FloodWait 冷却）
+- 支持规则分组与优先级管理（分组启停、分组排序、分组筛选）
+- 支持自动签到重试策略（指数退避 + 抖动 + 每日上限）
+- 支持健康检查与一键导出诊断包（脱敏配置 + 状态 + 日志）
+- 支持可选文件日志（按天滚动）
 - 支持 Docker 部署
 
 ## 适用场景
@@ -113,6 +118,16 @@ Copy-Item .env.example .env
 - `TG_SOURCE_CHAT`、`TG_TARGET_CHATS` 主要用于单规则简化模式
 - 使用 Web 控制台多规则管理时，系统会把规则写入 `TG_RULES_JSON`
 
+新增常用可选项（建议按需开启）：
+
+- `TG_FILE_LOG_ENABLED=true`：开启文件日志
+- `TG_FILE_LOG_PATH=logs/tg_forwarder.log`：文件日志路径
+- `TG_FILE_LOG_RETENTION_DAYS=7`：日志保留天数（按天滚动）
+- `HDHIVE_CHECKIN_MAX_RETRIES=4`：自动签到每日最大尝试次数（含首次）
+- `HDHIVE_CHECKIN_RETRY_BASE_SECONDS=60`：自动签到退避基准秒数
+- `HDHIVE_CHECKIN_RETRY_MAX_SECONDS=1800`：自动签到退避最大秒数
+- `HDHIVE_CHECKIN_RETRY_JITTER_SECONDS=15`：自动签到重试抖动秒数
+
 ### 4. 生成 Telegram 登录会话
 
 ```powershell
@@ -210,6 +225,8 @@ $env:COMPOSE_PROFILES='true'; docker compose up -d --build
 
 - 规则名称
 - 是否启用
+- 规则分组
+- 优先级（数字越小越靠前）
 - 源频道 / 群
 - 账号目标频道 / 群
 - Bot 目标频道 / 群
@@ -255,6 +272,15 @@ $env:COMPOSE_PROFILES='true'; docker compose up -d --build
 - dispatcher 状态
 - 失败任务队列
 - 成功历史统计
+- 健康状态（`/api/health`）
+- 诊断包导出（`/api/diagnostics/export`）
+
+### 健康检查与诊断
+
+- `GET /api/health`：返回服务状态、队列概览、日志缓冲占用、HDHive 签到状态
+- `GET /api/v1/health`：`/api/health` 的版本化别名
+- `GET /api/diagnostics/export`：导出诊断 JSON（脱敏 `.env`、健康状态、失败样本、近期日志）
+- 失败队列“重试”接口已升级为智能重试，返回重试数量与跳过统计
 
 ### 控制台前端如何构建
 
@@ -454,6 +480,11 @@ src/tg_forwarder/
 - 不要提交运行日志和临时压缩包
 - 把 `TG_DASHBOARD_PASSWORD` 改成自己的密码
 - 如果要公开演示，请先清理真实频道、群组和 Bot 信息
+
+## 发布与验收
+
+- 发布说明见：`RELEASE_NOTES.md`
+- 回归清单见：`QA_CHECKLIST.md`
 
 当前仓库已经忽略这些常见本地文件：
 

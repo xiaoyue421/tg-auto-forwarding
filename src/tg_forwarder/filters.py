@@ -252,23 +252,33 @@ def build_message_match_result(
 
 def build_match_note(match_result: MessageMatchResult) -> str | None:
     parts: list[str] = []
+    details: list[str] = []
     if match_result.matched_via == MATCH_VIA_MESSAGE:
         parts.append("命中来源=主规则")
+        details.append("主规则通过")
     if match_result.matched_all:
         parts.append(f"全部条件={','.join(match_result.matched_all)}")
+        details.append(f"all:{','.join(match_result.matched_all)}")
     if match_result.matched_any:
         parts.append(f"任一条件={','.join(match_result.matched_any)}")
+        details.append(f"any:{','.join(match_result.matched_any)}")
     if match_result.dispatch_text_override:
         parts.append("队列发送=直链")
+        details.append("text_override")
+    if details:
+        parts.append(f"命中详情={';'.join(details)}")
     return " | ".join(parts) or None
 
 
 def build_mismatch_note(match_result: MessageMatchResult, filters: FilterConfig) -> str | None:
     parts: list[str] = []
+    details: list[str] = []
     any_labels = build_positive_primary_any_labels(filters)
 
     if match_result.blocked:
         parts.append(f"未命中原因=命中黑名单条件:{','.join(match_result.blocked)}")
+        details.append(f"blocked:{','.join(match_result.blocked)}")
+        parts.append(f"未命中详情={';'.join(details)}")
         return " | ".join(parts)
 
     content_reason = build_content_mismatch_reason(
@@ -279,15 +289,21 @@ def build_mismatch_note(match_result: MessageMatchResult, filters: FilterConfig)
     )
     if content_reason:
         parts.append(f"未命中原因={content_reason}")
+        details.append(f"content:{content_reason}")
 
     if match_result.missing_all:
         parts.append(f"未命中原因=缺少全部条件:{','.join(match_result.missing_all)}")
+        details.append(f"missing_all:{','.join(match_result.missing_all)}")
 
     if any_labels and not match_result.matched_any:
         parts.append(f"未命中原因=未命中主规则任一条件:{','.join(any_labels)}")
+        details.append(f"missing_any:{','.join(any_labels)}")
 
     if not parts:
         parts.append("未命中原因=未通过当前规则")
+        details.append("generic_mismatch")
+    if details:
+        parts.append(f"未命中详情={';'.join(details)}")
     return " | ".join(parts)
 
 

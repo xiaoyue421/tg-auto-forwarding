@@ -6,10 +6,12 @@ import asyncio
 import gzip
 import json
 import logging
+import random
 import urllib.error
 import urllib.request
 from datetime import date
 from pathlib import Path
+from time import time
 from urllib.parse import quote
 
 import socks
@@ -22,6 +24,10 @@ CHECKIN_URL_API = "https://hdhive.com/api/open/checkin"
 CHECKIN_URL_SITE = "https://hdhive.com/"
 # 轮询间隔：到点后每天最多尝试一次；缩短间隔可更快在「新的一天」触发
 CHECKIN_POLL_INTERVAL_SEC = 300
+DEFAULT_RETRY_MAX_ATTEMPTS = 4
+DEFAULT_RETRY_BASE_DELAY_SEC = 60
+DEFAULT_RETRY_MAX_DELAY_SEC = 1800
+DEFAULT_RETRY_JITTER_SEC = 15
 
 HDHIVE_METHOD_API_KEY = "api_key"
 HDHIVE_METHOD_COOKIE = "cookie"
@@ -53,6 +59,11 @@ def _save_state(path: Path, data: dict[str, object]) -> None:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     except OSError:
         pass
+
+
+def load_checkin_state_for_env(env_path: Path) -> dict[str, object]:
+    """Expose current check-in state for health/status endpoints."""
+    return _load_state(state_path_for_env(env_path))
 
 
 def resolve_hdhive_proxy(values: dict[str, str]) -> tuple[ProxyConfig | None, str | None]:
@@ -299,8 +310,40 @@ def run_hdhive_checkin(
     return status, raw, msg, desc
 
 
+def _env_int(values: dict[str, str], key: str, default: int, *, minimum: int = 0, maximum: int = 10_000) -> int:
+    raw = (values.get(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _next_retry_delay_seconds(values: dict[str, str], attempt_index: int) -> int:
+    base = _env_int(values, "HDHIVE_CHECKIN_RETRY_BASE_SECONDS", DEFAULT_RETRY_BASE_DELAY_SEC, minimum=5, maximum=3600)
+    max_delay = _env_int(values, "HDHIVE_CHECKIN_RETRY_MAX_SECONDS", DEFAULT_RETRY_MAX_DELAY_SEC, minimum=10, maximum=24 * 3600)
+    jitter = _env_int(values, "HDHIVE_CHECKIN_RETRY_JITTER_SECONDS", DEFAULT_RETRY_JITTER_SEC, minimum=0, maximum=300)
+    exp_delay = base * (2 ** max(0, attempt_index - 1))
+    capped = min(exp_delay, max_delay)
+    if jitter <= 0:
+        return int(capped)
+    low = max(1, int(capped - jitter))
+    high = int(capped + jitter)
+    return random.randint(low, high)
+
+
+def _should_retry_status(status: int) -> bool:
+    if status < 0:
+        return True
+    if status in {408, 425, 429}:
+        return True
+    return status >= 500
+
+
 def maybe_run_scheduled_checkin(env_path: Path, log: logging.Logger) -> None:
-    """If enabled in .env and not yet attempted today, POST once and record date."""
+    """If enabled in .env, attempt check-in with bounded retry/backoff."""
     values = read_env_file(env_path)
     if not _env_bool(values, "HDHIVE_CHECKIN_ENABLED"):
         return
@@ -330,7 +373,24 @@ def maybe_run_scheduled_checkin(env_path: Path, log: logging.Logger) -> None:
     today = date.today().isoformat()
     spath = state_path_for_env(env_path)
     state = _load_state(spath)
-    if state.get("last_attempt_date") == today:
+    last_success_date = str(state.get("last_success_date") or "").strip()
+    if last_success_date == today:
+        return
+
+    if str(state.get("retry_exhausted_date") or "").strip() == today:
+        return
+
+    attempt_date = str(state.get("attempt_date") or "").strip()
+    attempts_today = int(state.get("attempt_count_today") or 0) if attempt_date == today else 0
+    max_attempts = _env_int(values, "HDHIVE_CHECKIN_MAX_RETRIES", DEFAULT_RETRY_MAX_ATTEMPTS, minimum=1, maximum=30)
+    if attempts_today >= max_attempts:
+        state["retry_exhausted_date"] = today
+        _save_state(spath, state)
+        return
+
+    now_epoch = int(time())
+    next_retry_epoch = int(state.get("next_retry_epoch") or 0) if attempt_date == today else 0
+    if next_retry_epoch > now_epoch:
         return
 
     status, raw, msg, desc = run_hdhive_checkin(
@@ -356,11 +416,30 @@ def maybe_run_scheduled_checkin(env_path: Path, log: logging.Logger) -> None:
         log.warning("HDHive 自动签到 HTTP %s: %s", status, preview[:500])
     else:
         log.warning("HDHive 自动签到失败: %s", preview[:500])
-    if status > 0:
-        state["last_attempt_date"] = today
-        state["last_http_status"] = status
-        state["last_body_preview"] = preview
-        _save_state(spath, state)
+    attempts_today += 1
+    state["attempt_date"] = today
+    state["attempt_count_today"] = attempts_today
+    state["last_http_status"] = status
+    state["last_body_preview"] = preview
+    state["last_attempt_epoch"] = now_epoch
+
+    if status == 200:
+        state["last_success_date"] = today
+        state["next_retry_epoch"] = 0
+        state["retry_exhausted_date"] = ""
+    elif _should_retry_status(status):
+        if attempts_today >= max_attempts:
+            state["retry_exhausted_date"] = today
+            state["next_retry_epoch"] = 0
+            log.warning("HDHive 自动签到重试次数已达上限：%s/%s", attempts_today, max_attempts)
+        else:
+            delay = _next_retry_delay_seconds(values, attempts_today)
+            state["next_retry_epoch"] = now_epoch + delay
+            log.warning("HDHive 自动签到将在约 %s 秒后重试（%s/%s）", delay, attempts_today, max_attempts)
+    else:
+        state["retry_exhausted_date"] = today
+        state["next_retry_epoch"] = 0
+    _save_state(spath, state)
 
 
 async def hdhive_checkin_loop(stop: asyncio.Event, env_path: Path, log: logging.Logger) -> None:

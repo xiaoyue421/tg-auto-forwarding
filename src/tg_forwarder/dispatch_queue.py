@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import re
 import sqlite3
 import time
 from typing import Iterable
@@ -137,6 +138,13 @@ class DispatchSuccessHistoryRuleRecord:
     rule_name: str
     count: int
     last_completed_at: float
+
+
+@dataclass(slots=True)
+class RetryFailedDispatchResult:
+    retried_count: int
+    skipped_non_retryable: int = 0
+    skipped_cooldown: int = 0
 
 
 def default_queue_db_path(config_path: str | Path) -> Path:
@@ -685,6 +693,62 @@ def list_failed_dispatch_jobs(path: str | Path, limit: int = 100) -> list[Failed
     ]
 
 
+_NON_RETRYABLE_HINTS = (
+    "chat_write_forbidden",
+    "chat admin required",
+    "forbidden",
+    "user is blocked",
+    "bot was blocked",
+    "bot was kicked",
+    "channel private",
+    "peer id invalid",
+    "chat not found",
+    "username invalid",
+)
+
+_RETRYABLE_HINTS = (
+    "floodwait",
+    "timeout",
+    "temporarily",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "network",
+    "server error",
+    "too many requests",
+    "retry later",
+)
+
+_FLOODWAIT_SECONDS_RE = re.compile(r"floodwait[^0-9]*([0-9]{1,6})", re.IGNORECASE)
+
+
+def _estimate_retry_after_seconds(error_text: str) -> int:
+    text = (error_text or "").strip().lower()
+    m = _FLOODWAIT_SECONDS_RE.search(text)
+    if not m:
+        return 0
+    try:
+        return max(0, min(24 * 3600, int(m.group(1))))
+    except ValueError:
+        return 0
+
+
+def _is_non_retryable_error(error_text: str) -> bool:
+    text = (error_text or "").strip().lower()
+    if not text:
+        return False
+    return any(token in text for token in _NON_RETRYABLE_HINTS)
+
+
+def _is_retryable_error(error_text: str) -> bool:
+    text = (error_text or "").strip().lower()
+    if not text:
+        return True
+    if _is_non_retryable_error(text):
+        return False
+    return any(token in text for token in _RETRYABLE_HINTS)
+
+
 def retry_failed_dispatch_jobs(path: str | Path, job_ids: Iterable[int] | None = None) -> int:
     db_path = ensure_dispatch_queue(path)
     now = time.time()
@@ -741,6 +805,63 @@ def retry_failed_dispatch_jobs(path: str | Path, job_ids: Iterable[int] | None =
         )
         conn.commit()
         return int(delivery_cursor.rowcount or 0)
+
+
+def retry_failed_dispatch_jobs_smart(path: str | Path, job_ids: Iterable[int] | None = None) -> RetryFailedDispatchResult:
+    """Retry only likely-transient failures and obey FloodWait-like cooldown hints."""
+    db_path = ensure_dispatch_queue(path)
+    now = time.time()
+    job_id_list = sorted({int(item) for item in (job_ids or [])})
+    retried_ids: list[int] = []
+    skipped_non_retryable = 0
+    skipped_cooldown = 0
+    with _connect(db_path) as conn:
+        if job_id_list:
+            placeholders = ",".join("?" for _ in job_id_list)
+            rows = conn.execute(
+                f"""
+                SELECT id, updated_at, last_error
+                FROM dispatch_jobs
+                WHERE status = ?
+                  AND id IN ({placeholders})
+                """,
+                (JOB_STATUS_FAILED, *job_id_list),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, updated_at, last_error
+                FROM dispatch_jobs
+                WHERE status = ?
+                """,
+                (JOB_STATUS_FAILED,),
+            ).fetchall()
+
+    for row in rows:
+        err = str(row["last_error"] or "")
+        if not _is_retryable_error(err):
+            skipped_non_retryable += 1
+            continue
+        retry_after = _estimate_retry_after_seconds(err)
+        updated_at = float(row["updated_at"] or 0.0)
+        if retry_after > 0 and (updated_at + retry_after) > now:
+            skipped_cooldown += 1
+            continue
+        retried_ids.append(int(row["id"]))
+
+    if not retried_ids:
+        return RetryFailedDispatchResult(
+            retried_count=0,
+            skipped_non_retryable=skipped_non_retryable,
+            skipped_cooldown=skipped_cooldown,
+        )
+
+    retried_count = retry_failed_dispatch_jobs(db_path, job_ids=retried_ids)
+    return RetryFailedDispatchResult(
+        retried_count=retried_count,
+        skipped_non_retryable=skipped_non_retryable,
+        skipped_cooldown=skipped_cooldown,
+    )
 
 
 def clear_failed_dispatch_jobs(path: str | Path, job_ids: Iterable[int] | None = None) -> int:
