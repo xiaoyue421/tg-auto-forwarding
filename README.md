@@ -256,6 +256,24 @@ $env:COMPOSE_PROFILES='true'; docker compose up -d --build
 - 失败任务队列
 - 成功历史统计
 
+### 控制台前端如何构建
+
+`frontend/vite.config.ts` 将构建产物输出到 `src/tg_forwarder/web/static`。修改 `frontend/src` 后在本机执行：
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+然后再启动或打包使用控制台的进程，即可加载最新界面。
+
+### 故障排查（运维）
+
+- **Bot 登录出现 `FloodWaitError` / `ImportBotAuthorization` 限流**：设置环境变量 `TG_BOT_FLOODWAIT_MAX_SLEEP_SECONDS` 为略大于 Telegram 提示的等待秒数；适当增大 `TG_BOT_POOL_START_STAGGER_SECONDS`；并建议配置 `TG_BOT_SESSION_DIR`，让 Bot 使用磁盘上的 Telethon SQLite 会话，避免每次进程重启都重新走一遍机器人鉴权。
+- **日志显示已转发但目标频道看不到**：若使用 `account_first`，会优先用**登录账号**投递，成功时可能不再用 Bot；请查看「策略转发摘要」日志中的 `本轮投递=` 说明。
+- **日志 API**：`GET /api/logs` 返回 `items` 与 `total`（内存中条数）；可选查询参数 `before_sequence` 用于分页拉取更早的记录（值小于该序号的条目）。
+
 ## 发送策略
 
 全局和单条规则都可以设置发送策略：

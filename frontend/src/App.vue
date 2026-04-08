@@ -1164,7 +1164,7 @@ export default dashboard;
             </div>
             <div class="log-filter-bar">
               <button class="chip-btn" :data-active="ui.logFilter === 'all'" @click="setLogFilter('all')">
-                全部日志 {{ sortedLogs.length }}
+                全部日志 {{ sortedLogsForSourceScope.length }}
               </button>
               <button class="chip-btn" :data-active="ui.logFilter === 'hdhive'" @click="setLogFilter('hdhive')">
                 签到日志 {{ hdhiveCheckinLogCount }}

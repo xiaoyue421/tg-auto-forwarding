@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient
-from telethon.sessions import MemorySession, StringSession
+from telethon.sessions import MemorySession, SQLiteSession, StringSession
 from telethon.tl.custom.message import Message
 from telethon.utils import get_display_name
 
@@ -488,10 +489,21 @@ def _build_user_client_instance(settings: TelegramSettings, proxy: object | None
     )
 
 
+def build_bot_telethon_session(settings: TelegramSettings, bot_token: str) -> MemorySession | SQLiteSession:
+    """Use SQLite on disk when ``bot_session_dir`` is set to avoid ImportBotAuthorization on every restart."""
+    raw = (settings.bot_session_dir or "").strip()
+    if not raw:
+        return MemorySession()
+    base = Path(raw).expanduser().resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(bot_token.encode("utf-8")).hexdigest()[:48]
+    return SQLiteSession(str(base / f"bot_{digest}.session"))
+
+
 async def build_bot_client(settings: TelegramSettings, bot_token: str) -> TelegramClient:
     def client_builder(proxy: object | None) -> TelegramClient:
         return build_telegram_client(
-            session=MemorySession(),
+            session=build_bot_telethon_session(settings, bot_token),
             api_id=settings.api_id,
             api_hash=settings.api_hash,
             device_model="TGForwarderDashboardBot",

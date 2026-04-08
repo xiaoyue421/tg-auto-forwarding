@@ -229,6 +229,8 @@ export default {
       },
       validation: null,
       logs: [],
+      /** 服务端内存日志总条数（可能与当前拉取的 items 长度不同） */
+      logBufferTotal: 0,
       timers: [],
       /** 扫码登录轮询（独立于服务状态轮询 timers） */
       telegramQrPollTimer: null,
@@ -384,17 +386,21 @@ export default {
     sortedLogs() {
       return this.sortLogsNewestFirst(this.logs);
     },
+    /** Logs visible under the current「来源」dropdown (same scope as chip counts). */
+    sortedLogsForSourceScope() {
+      return this.getLogsBySourceFilter(this.sortedLogs);
+    },
     monitorLogCount() {
-      return this.sortedLogs.filter((item) => this.isMonitorLog(item)).length;
+      return this.sortedLogsForSourceScope.filter((item) => this.isMonitorLog(item)).length;
     },
     errorLogCount() {
-      return this.sortedLogs.filter((item) => item.level === "ERROR").length;
+      return this.sortedLogsForSourceScope.filter((item) => item.level === "ERROR").length;
     },
     detectionLogCount() {
-      return this.sortedLogs.filter((item) => this.isDetectionLog(item)).length;
+      return this.sortedLogsForSourceScope.filter((item) => this.isDetectionLog(item)).length;
     },
     hdhiveCheckinLogCount() {
-      return this.sortedLogs.filter((item) => this.isHdhiveCheckinLog(item)).length;
+      return this.sortedLogsForSourceScope.filter((item) => this.isHdhiveCheckinLog(item)).length;
     },
     canSearch() {
       return Boolean(this.normalizeSearchQuery(this.search.query));
@@ -451,7 +457,11 @@ export default {
         { key: "rules", label: `规则 ${this.ruleCount}`, shortLabel: "规则" },
         { key: "search", label: `搜索 ${this.searchResultCount}`, shortLabel: "搜索" },
         { key: "status", label: `状态 ${this.runningWorkerCount}`, shortLabel: "状态" },
-        { key: "logs", label: "日志", shortLabel: "日志" },
+        {
+          key: "logs",
+          label: `日志 ${this.logBufferTotal || this.sortedLogs.length}`,
+          shortLabel: `日志 ${this.logBufferTotal || this.sortedLogs.length}`,
+        },
       ];
     },
     activeTabMeta() {
@@ -809,12 +819,35 @@ export default {
       sources.sort((a, b) => a.localeCompare(b, "zh"));
       return [{ key: "all", label: "全部源" }, ...sources.map((key) => ({ key, label: key }))];
     },
+    normalizeLogSourceKey(value) {
+      const s = String(value || "").trim();
+      if (!s) {
+        return "";
+      }
+      return s.startsWith("@") ? s.slice(1) : s;
+    },
+    extractLogSourceKey(item = {}) {
+      const direct = String(item.source || "").trim();
+      if (direct) {
+        return this.normalizeLogSourceKey(direct);
+      }
+      const text = this.displayLogMessage(item);
+      const m = String(text).match(/来源=([^|]+)/);
+      return m ? this.normalizeLogSourceKey(m[1]) : "";
+    },
     getLogsBySourceFilter(items) {
       const selected = String(this.ui.logSourceFilter || "all").trim() || "all";
       if (selected === "all") {
         return items;
       }
-      return (items || []).filter((item) => String(item.source || "").trim() === selected);
+      const want = this.normalizeLogSourceKey(selected);
+      return (items || []).filter((item) => {
+        const got = this.extractLogSourceKey(item);
+        if (!got) {
+          return true;
+        }
+        return got === want;
+      });
     },
     setLogSourceFilter(value) {
       this.ui.logSourceFilter = String(value || "all").trim() || "all";
@@ -1503,6 +1536,7 @@ export default {
       try {
         const response = await this.fetchJson("/api/logs?limit=220");
         this.logs = response.data.items || [];
+        this.logBufferTotal = Number(response.data.total ?? this.logs.length);
         this.$nextTick(() => this.syncLogBoxState());
       } catch (err) {
         if (!silent) {

@@ -193,6 +193,15 @@ class PersistentQueueDispatcher:
                         selection.skip_ids,
                         selection.skip_reason or "strategy skip",
                     )
+                    if selection.skip_reason:
+                        monitor_log(
+                            self.logger,
+                            logging.INFO,
+                            "队列策略跳过部分目标",
+                            message=message,
+                            context=log_context,
+                            note=f"queue_id={job.id} | {selection.skip_reason}",
+                        )
                     if not selection.batch:
                         continue
 

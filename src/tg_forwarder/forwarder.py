@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 import hashlib
 import io
 import logging
+from dataclasses import dataclass, field
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
@@ -12,15 +12,56 @@ from telethon.tl import functions
 from telethon.tl.custom.message import Message
 
 from tg_forwarder.config import (
-    FORWARD_STRATEGY_ACCOUNT_ONLY,
     FORWARD_STRATEGY_ACCOUNT_FIRST,
-    FORWARD_STRATEGY_BOT_ONLY,
+    FORWARD_STRATEGY_ACCOUNT_ONLY,
     FORWARD_STRATEGY_BOT_FIRST,
+    FORWARD_STRATEGY_BOT_ONLY,
     FORWARD_STRATEGY_PARALLEL,
     ForwardTarget,
     normalize_forward_strategy,
 )
 from tg_forwarder.monitoring import ForwardLogContext, monitor_log
+
+
+def _emit_forward_strategy_summary(
+    logger: logging.Logger,
+    *,
+    strategy: str,
+    result: "ForwardDispatchResult",
+    message: Message,
+    log_context: ForwardLogContext | None,
+) -> None:
+    ac = result.account_success_count
+    bc = result.bot_success_count
+    note_parts = [
+        f"strategy={strategy}",
+        f"账号成功={ac}",
+        f"Bot成功={bc}",
+    ]
+    if strategy == FORWARD_STRATEGY_ACCOUNT_FIRST:
+        if ac > 0:
+            note_parts.append("本轮投递=登录账号")
+        elif bc > 0:
+            note_parts.append("本轮投递=Bot(回退)")
+    elif strategy == FORWARD_STRATEGY_BOT_FIRST:
+        if bc > 0:
+            note_parts.append("本轮投递=Bot")
+        elif ac > 0:
+            note_parts.append("本轮投递=登录账号(回退)")
+    elif strategy == FORWARD_STRATEGY_PARALLEL:
+        note_parts.append("本轮投递=账号与Bot并行")
+    elif strategy == FORWARD_STRATEGY_ACCOUNT_ONLY:
+        note_parts.append("本轮投递=仅登录账号")
+    elif strategy == FORWARD_STRATEGY_BOT_ONLY:
+        note_parts.append("本轮投递=仅Bot")
+    monitor_log(
+        logger,
+        logging.INFO,
+        "策略转发摘要",
+        message=message,
+        context=log_context,
+        note=" | ".join(note_parts),
+    )
 
 
 @dataclass(slots=True)
@@ -99,37 +140,36 @@ async def forward_with_strategy(
             account_task,
             bot_task,
         )
-        return result
-
-    if normalized_strategy == FORWARD_STRATEGY_ACCOUNT_ONLY:
+    elif normalized_strategy == FORWARD_STRATEGY_ACCOUNT_ONLY:
         result.account_success_count = await run_account()
-        return result
-
-    if normalized_strategy == FORWARD_STRATEGY_BOT_ONLY:
+    elif normalized_strategy == FORWARD_STRATEGY_BOT_ONLY:
         result.bot_success_count = await run_bot()
-        return result
-
-    if normalized_strategy == FORWARD_STRATEGY_BOT_FIRST:
+    elif normalized_strategy == FORWARD_STRATEGY_BOT_FIRST:
         result.bot_success_count = await run_bot()
-        if result.bot_success_count > 0 or not account_targets:
-            return result
-        logger.info(
-            "bot-first strategy fallback to account targets, message_id=%s",
-            message.id,
-            extra={"monitor": True},
-        )
+        if result.bot_success_count <= 0 and account_targets:
+            logger.info(
+                "bot-first strategy fallback to account targets, message_id=%s",
+                message.id,
+                extra={"monitor": True},
+            )
+            result.account_success_count = await run_account()
+    else:
         result.account_success_count = await run_account()
-        return result
+        if result.account_success_count <= 0 and bot_targets:
+            logger.info(
+                "account-first strategy fallback to bot targets, message_id=%s",
+                message.id,
+                extra={"monitor": True},
+            )
+            result.bot_success_count = await run_bot()
 
-    result.account_success_count = await run_account()
-    if result.account_success_count > 0 or not bot_targets:
-        return result
-    logger.info(
-        "account-first strategy fallback to bot targets, message_id=%s",
-        message.id,
-        extra={"monitor": True},
+    _emit_forward_strategy_summary(
+        logger,
+        strategy=normalized_strategy,
+        result=result,
+        message=message,
+        log_context=log_context,
     )
-    result.bot_success_count = await run_bot()
     return result
 
 
@@ -834,7 +874,7 @@ async def _forward_to_single_bot_target_chain(
     monitor_log(
         logger,
         logging.ERROR,
-        "Bot 鐩爣涓嶅彲鐢?",
+        "Bot 目标不可用",
         message=message,
         target=target.chat,
         context=log_context,

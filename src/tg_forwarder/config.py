@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
 import json
 import os
 import re
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from dotenv import load_dotenv
 import yaml
+from dotenv import load_dotenv
 
 from tg_forwarder.env_utils import read_env_file
-
 
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::-([^}]*))?\}")
 LIST_SPLIT_PATTERN = re.compile(r"[,;\r\n]+")
@@ -80,6 +79,8 @@ class TelegramSettings:
     proxy: ProxyConfig | None = None
     proxies: list[ProxyConfig] = field(default_factory=list)
     bot_token: str | None = None
+    """Directory for Telethon SQLite bot sessions (TG_BOT_SESSION_DIR). Empty = MemorySession per process."""
+    bot_session_dir: str | None = None
     forward_strategy: str = FORWARD_STRATEGY_PARALLEL
     rate_limit_protection: bool = False
     rate_limit_delay_seconds: float = DEFAULT_RATE_LIMIT_DELAY_SECONDS
@@ -258,6 +259,7 @@ class AppConfig:
                         proxy=self.telegram.proxy,
                         proxies=list(self.telegram.proxies),
                         bot_token=self.telegram.bot_token,
+                        bot_session_dir=self.telegram.bot_session_dir,
                         forward_strategy=self.telegram.forward_strategy,
                         rate_limit_protection=self.telegram.rate_limit_protection,
                         rate_limit_delay_seconds=self.telegram.rate_limit_delay_seconds,
@@ -356,6 +358,7 @@ def load_simple_env_config(env_path: str | Path) -> AppConfig:
             env_optional_from(env_values, "TG_SEARCH_DEFAULT_MODE"),
             "TG_SEARCH_DEFAULT_MODE",
         ),
+        bot_session_dir=parse_bot_session_dir_env(env_values, resolved_env_path.parent),
     )
     workers = parse_simple_env_workers(env_values, resolved_env_path.parent, worker_name)
     return AppConfig(
@@ -426,6 +429,7 @@ def load_simple_env_telegram_settings(env_path: str | Path) -> TelegramSettings:
             env_optional_from(env_values, "TG_SEARCH_DEFAULT_MODE"),
             "TG_SEARCH_DEFAULT_MODE",
         ),
+        bot_session_dir=parse_bot_session_dir_env(env_values, resolved_env_path.parent),
     )
 
 
@@ -522,6 +526,29 @@ def load_yaml_with_env(path: str | Path) -> dict[str, Any]:
     return data
 
 
+def parse_bot_session_dir_env(env_values: dict[str, str], config_parent: Path) -> str | None:
+    raw = env_optional_from(env_values, "TG_BOT_SESSION_DIR")
+    return _normalize_bot_session_dir_value(raw, config_parent)
+
+
+def _parse_bot_session_dir_mapping(raw: Any, base_dir: Path) -> str | None:
+    if raw in (None, ""):
+        return None
+    return _normalize_bot_session_dir_value(str(raw).strip(), base_dir)
+
+
+def _normalize_bot_session_dir_value(raw: str | None, base_dir: Path) -> str | None:
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not s or s.lower() in ("memory", "none", "off", "-"):
+        return None
+    resolved = resolve_optional_path(base_dir, s)
+    if resolved is not None:
+        return str(Path(resolved).resolve())
+    return str(Path(s).expanduser().resolve())
+
+
 def parse_telegram_settings(data: dict[str, Any], base_dir: Path) -> TelegramSettings:
     if not isinstance(data, dict):
         raise ConfigError("telegram must be a mapping object")
@@ -567,6 +594,7 @@ def parse_telegram_settings(data: dict[str, Any], base_dir: Path) -> TelegramSet
             data.get("search_default_mode"),
             "telegram.search_default_mode",
         ),
+        bot_session_dir=_parse_bot_session_dir_mapping(data.get("bot_session_dir"), base_dir),
     )
 
 
@@ -1248,6 +1276,7 @@ def worker_runtime_from_payload(payload: dict[str, Any]) -> WorkerRuntimeConfig:
             telegram_data.get("search_default_mode"),
             "telegram.search_default_mode",
         ),
+        bot_session_dir=clean_optional_string(telegram_data.get("bot_session_dir")),
     )
     runtime = WorkerRuntimeConfig(
         name=str(payload["name"]),

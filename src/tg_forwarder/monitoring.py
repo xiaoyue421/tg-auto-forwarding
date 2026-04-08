@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from tg_forwarder.message_index import extract_message_button_values
 
-
 WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
+def normalize_log_source_key(value: str) -> str:
+    s = value.strip()
+    return s[1:] if s.startswith("@") else s
 
 
 @dataclass(slots=True)
@@ -55,6 +59,9 @@ def monitor_log(
     }
     if detect:
         extra["detect"] = True
+    src_key = ctx.source or (build_message_source(message) if message is not None else None)
+    if src_key and str(src_key).strip() and str(src_key).strip() != "-":
+        extra["log_source"] = normalize_log_source_key(str(src_key))
     logger.log(level, " | ".join(parts), extra=extra)
 
 

@@ -144,7 +144,7 @@ async def explain_message_match(
     def _maybe_resolve_hdhive_override() -> str | None:
         """When enabled and resource URL present:
         - success: return redirect_url
-        - failure: return '链接失效' (do not fall back to forwarding original message)
+        - failure: return '链接失效' or 'HDHive 链接无权获取' (do not fall back to forwarding original message)
         - no resource url present: return None (normal behavior)
         """
         if not bool(getattr(filters, "hdhive_resource_resolve_forward", False)):
@@ -156,7 +156,8 @@ async def explain_message_match(
         if not urls:
             return None
         if not cookie:
-            return "链接失效"
+            # No cookie means we cannot access redirect_url (usually requires logged-in permission).
+            return "HDHive 链接无权获取"
         from tg_forwarder.config import parse_proxy_from_env
 
         proxy = None
@@ -167,7 +168,7 @@ async def explain_message_match(
                 proxy = None
 
         for url in urls:
-            ok, redirect_url, _err = resolve_hdhive_resource_redirect_sync(
+            ok, redirect_url, err = resolve_hdhive_resource_redirect_sync(
                 url,
                 cookie_header=cookie,
                 proxy=proxy,
@@ -175,6 +176,12 @@ async def explain_message_match(
             )
             if ok and redirect_url.strip():
                 return redirect_url.strip()
+            err_text = (err or "").strip()
+            # Permission-like errors should be surfaced clearly.
+            if err_text.startswith("HTTP错误:"):
+                code = err_text.replace("HTTP错误:", "").strip()
+                if code in {"401", "403"}:
+                    return "HDHive 链接无权获取"
         return "链接失效"
 
     has_pos = has_positive_primary_filters(filters)

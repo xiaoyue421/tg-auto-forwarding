@@ -979,9 +979,12 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     def get_logs(
         request: Request,
         limit: int = Query(default=200, ge=10, le=1000),
+        before_sequence: int | None = Query(default=None),
     ) -> ApiResponse:
         ensure_authenticated(request)
-        return ApiResponse(data={"items": log_handler.list_records(limit)})
+        total = log_handler.total_record_count()
+        items = log_handler.list_records(limit, before_sequence=before_sequence)
+        return ApiResponse(data={"items": items, "total": total})
 
     @app.post("/api/logs/clear")
     def clear_logs(request: Request, payload: LogsClearPayload) -> ApiResponse:

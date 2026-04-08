@@ -207,5 +207,27 @@ async def start_bot_client_with_proxy_pool(
             break
 
     if last_error is not None:
+        if isinstance(last_error, FloodWaitError) and logger is not None:
+            wait_s = int(getattr(last_error, "seconds", 0) or 0)
+            if max_flood_sleep <= 0 and wait_s > 0:
+                logger.error(
+                    "%s: Telegram requires ~%ss before bot login (FloodWait). "
+                    "Set TG_BOT_FLOODWAIT_MAX_SLEEP_SECONDS to at least %s to auto-wait and retry, "
+                    "or increase TG_BOT_POOL_START_STAGGER_SECONDS / avoid frequent restarts.",
+                    scope,
+                    wait_s,
+                    wait_s + 5,
+                    extra={"monitor": True},
+                )
+            elif max_flood_sleep > 0 and wait_s > max_flood_sleep:
+                logger.error(
+                    "%s: FloodWait %ss is longer than TG_BOT_FLOODWAIT_MAX_SLEEP_SECONDS=%s; "
+                    "raise the cap (e.g. %s) or Telegram will keep rate-limiting.",
+                    scope,
+                    wait_s,
+                    max_flood_sleep,
+                    wait_s + 5,
+                    extra={"monitor": True},
+                )
         raise last_error
     raise RuntimeError(f"{scope} has no available proxy candidates")
