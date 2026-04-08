@@ -39,8 +39,13 @@ class MessageMatchResult:
     dispatch_text_override: str | None = None
 
 
-async def message_matches(message: Message, filters: FilterConfig) -> bool:
-    return (await explain_message_match(message, filters)).matched
+async def message_matches(
+    message: Message,
+    filters: FilterConfig,
+    *,
+    env_values: dict[str, str] | None = None,
+) -> bool:
+    return (await explain_message_match(message, filters, env_values=env_values)).matched
 
 
 def filter_requires_keyword_layer(filters: FilterConfig) -> bool:
@@ -84,6 +89,8 @@ def collect_blocked_matches(
 async def explain_message_match(
     message: Message,
     filters: FilterConfig,
+    *,
+    env_values: dict[str, str] | None = None,
 ) -> MessageMatchResult:
     if getattr(message, "action", None) is not None:
         return MessageMatchResult(matched=False)
@@ -151,7 +158,8 @@ async def explain_message_match(
             return None
         import os
 
-        cookie = (os.getenv("HDHIVE_COOKIE") or "").strip()
+        values = env_values if env_values is not None else dict(os.environ)
+        cookie = (values.get("HDHIVE_COOKIE") or "").strip()
         urls = collect_hdhive_resource_urls_from_message(message, max_urls=3)
         if not urls:
             return None
@@ -161,9 +169,9 @@ async def explain_message_match(
         from tg_forwarder.config import parse_proxy_from_env
 
         proxy = None
-        if str(os.getenv("HDHIVE_CHECKIN_USE_PROXY") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
+        if str(values.get("HDHIVE_CHECKIN_USE_PROXY") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
             try:
-                proxy = parse_proxy_from_env(dict(os.environ))
+                proxy = parse_proxy_from_env(values)
             except Exception:
                 proxy = None
 

@@ -28,6 +28,7 @@ from tg_forwarder.dispatch_queue import (
     get_worker_offset,
     set_worker_offset,
 )
+from tg_forwarder.env_utils import read_env_file
 from tg_forwarder.filters import (
     MessageMatchResult,
     build_match_note,
@@ -68,6 +69,9 @@ class ChannelWorker:
         self.queue_db_path = queue_db_path
         self.logger = logging.getLogger(f"tg_forwarder.worker.{runtime.name}")
         env_cfg = Path(config_path).resolve() if config_path else None
+        self._env_values: dict[str, str] = {}
+        if env_cfg is not None and env_cfg.is_file():
+            self._env_values = read_env_file(env_cfg)
         self._message_hooks: MessageHookSet = (
             load_message_hooks(env_cfg)
             if env_cfg is not None and env_cfg.is_file()
@@ -327,7 +331,11 @@ class ChannelWorker:
             )
             return True
 
-        match_result = await explain_message_match(message, self.runtime.filters)
+        match_result = await explain_message_match(
+            message,
+            self.runtime.filters,
+            env_values=self._env_values or None,
+        )
         match_result = await self._apply_module_after_match_hooks(message, source_key, match_result)
         if not match_result.matched:
             monitor_log(
