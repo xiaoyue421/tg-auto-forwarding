@@ -22,6 +22,7 @@ from tg_forwarder.config import (
     ConfigError,
     ForwardTarget,
     TelegramSettings,
+    WorkerConfig,
     filter_targets_by_forward_strategy,
     load_config,
     normalize_optional_forward_strategy,
@@ -30,6 +31,8 @@ from tg_forwarder.config import (
     parse_list_value,
     resolve_forward_strategy,
 )
+from tg_forwarder.env_utils import read_env_file
+from tg_forwarder.filters import explain_message_match
 from tg_forwarder.forwarder import BotForwardContext, build_message_link, forward_with_strategy
 from tg_forwarder.message_index import extract_message_keyword_values
 from tg_forwarder.monitoring import ForwardLogContext, build_targets_note, monitor_log
@@ -44,6 +47,39 @@ SEARCH_SOURCE_CONCURRENCY = 4
 SEARCH_NATIVE_FETCH_CAP = 120
 SEARCH_LOCAL_SCAN_CAP = 4000
 SEARCH_TERM_SPLIT_PATTERN = re.compile(r"[\s,，;；、|/]+")
+
+
+def _find_worker_by_name(config: AppConfig, name: str) -> WorkerConfig | None:
+    key = (name or "").strip()
+    if not key:
+        return None
+    for worker in config.workers:
+        if worker.name == key:
+            return worker
+    return None
+
+
+async def _resolve_manual_forward_rule_match(
+    *,
+    config: AppConfig,
+    env_values: dict[str, str],
+    message: Message,
+    rule_names: list[str],
+) -> tuple[str | None, str]:
+    """Try each rule in order; return (text override or None to forward original, matched rule name)."""
+    for raw in rule_names:
+        worker = _find_worker_by_name(config, raw)
+        if worker is None:
+            LOGGER.warning("manual forward: unknown rule name %s", raw)
+            continue
+        match_result = await explain_message_match(
+            message,
+            worker.filters,
+            env_values=env_values,
+        )
+        if match_result.matched:
+            return match_result.dispatch_text_override, worker.name
+    return None, ""
 
 
 def search_messages(
@@ -95,16 +131,19 @@ def manual_forward_message(
     target_chats: str,
     bot_target_chats: str,
     forward_strategy: str | None = None,
+    rule_names: list[str] | None = None,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     return asyncio.run(
         _manual_forward_message(
             config=config,
+            config_path=config_path,
             source_chat=source_chat,
             message_id=message_id,
             target_chats=target_chats,
             bot_target_chats=bot_target_chats,
             forward_strategy=forward_strategy,
+            rule_names=rule_names,
         )
     )
 
@@ -116,15 +155,18 @@ async def manual_forward_message_async(
     target_chats: str,
     bot_target_chats: str,
     forward_strategy: str | None = None,
+    rule_names: list[str] | None = None,
 ) -> dict[str, Any]:
     config = load_config(config_path)
     return await _manual_forward_message(
         config=config,
+        config_path=config_path,
         source_chat=source_chat,
         message_id=message_id,
         target_chats=target_chats,
         bot_target_chats=bot_target_chats,
         forward_strategy=forward_strategy,
+        rule_names=rule_names,
     )
 async def _search_messages(
     config: AppConfig,
@@ -209,11 +251,13 @@ async def _search_messages(
 
 async def _manual_forward_message(
     config: AppConfig,
+    config_path: str | Path,
     source_chat: str,
     message_id: int,
     target_chats: str,
     bot_target_chats: str,
     forward_strategy: str | None = None,
+    rule_names: list[str] | None = None,
 ) -> dict[str, Any]:
     account_targets = parse_manual_targets(target_chats, "target_chats")
     bot_targets = parse_manual_targets(bot_target_chats, "bot_target_chats")
@@ -244,17 +288,37 @@ async def _manual_forward_message(
         message = await user_client.get_messages(source_entity, ids=message_id)
         if message is None:
             raise ConfigError("message not found")
+
+        env_values = read_env_file(config_path)
+        text_override: str | None = None
+        matched_rule = ""
+        rules_in = [str(x).strip() for x in (rule_names or []) if str(x).strip()]
+        if rules_in:
+            text_override, matched_rule = await _resolve_manual_forward_rule_match(
+                config=config,
+                env_values=env_values,
+                message=message,
+                rule_names=rules_in,
+            )
+            if not matched_rule:
+                raise ConfigError(
+                    "消息未命中任何列出的规则（关键词 / HDHive 等），未执行转发。"
+                )
+
         log_context = ForwardLogContext(mode="手动", source=str(source_reference))
+        note_extra = f"strategy={effective_strategy}"
+        if matched_rule:
+            if (text_override or "").strip():
+                note_extra += f" | rule={matched_rule} | dispatch=text_override"
+            else:
+                note_extra += f" | rule={matched_rule} | dispatch=forward_original"
         monitor_log(
             LOGGER,
             logging.INFO,
             "执行手动转发",
             message=message,
             context=log_context,
-            note=(
-                f"{build_targets_note(account_targets, bot_targets)} | "
-                f"strategy={effective_strategy}"
-            ),
+            note=f"{build_targets_note(account_targets, bot_targets)} | {note_extra}",
         )
 
         resolved_targets: list[tuple[ForwardTarget, object]] = []
@@ -286,6 +350,7 @@ async def _manual_forward_message(
             bot_targets=bot_targets,
             logger=LOGGER,
             log_context=log_context,
+            text_override=text_override,
         )
 
         return {
@@ -298,6 +363,8 @@ async def _manual_forward_message(
             "bot_sent": dispatch_result.bot_success_count,
             "attempted_account": dispatch_result.attempted_account,
             "attempted_bot": dispatch_result.attempted_bot,
+            "matched_rule": matched_rule,
+            "used_text_override": bool((text_override or "").strip()),
         }
     finally:
         with suppress(Exception):

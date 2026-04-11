@@ -102,35 +102,58 @@ async def forward_with_strategy(
     bot_targets: list[ForwardTarget],
     logger: logging.Logger,
     log_context: ForwardLogContext | None = None,
+    text_override: str | None = None,
 ) -> ForwardDispatchResult:
     normalized_strategy = normalize_forward_strategy(strategy, "telegram.forward_strategy")
     result = ForwardDispatchResult(strategy=normalized_strategy)
+    override_text = (text_override or "").strip()
 
     async def run_account() -> int:
         result.attempted_account = bool(account_targets)
         if not account_targets:
             return 0
-        result.account_results = await forward_to_targets_detailed(
-            user_client,
-            message,
-            account_targets,
-            logger,
-            log_context=log_context,
-        )
+        if override_text:
+            result.account_results = await send_text_to_targets_detailed(
+                user_client,
+                override_text,
+                account_targets,
+                logger,
+                log_context=log_context,
+                message=message,
+            )
+        else:
+            result.account_results = await forward_to_targets_detailed(
+                user_client,
+                message,
+                account_targets,
+                logger,
+                log_context=log_context,
+            )
         return sum(1 for item in result.account_results if item.success)
 
     async def run_bot() -> int:
         result.attempted_bot = bool(bot_targets)
         if not bot_targets:
             return 0
-        result.bot_results = await forward_to_bot_targets_detailed(
-            user_client,
-            bot_contexts,
-            message,
-            bot_targets,
-            logger,
-            log_context=log_context,
-        )
+        if override_text:
+            result.bot_results = await send_text_to_bot_targets_detailed(
+                user_client,
+                bot_contexts,
+                override_text,
+                bot_targets,
+                logger,
+                log_context=log_context,
+                message=message,
+            )
+        else:
+            result.bot_results = await forward_to_bot_targets_detailed(
+                user_client,
+                bot_contexts,
+                message,
+                bot_targets,
+                logger,
+                log_context=log_context,
+            )
         return sum(1 for item in result.bot_results if item.success)
 
     if normalized_strategy == FORWARD_STRATEGY_PARALLEL:

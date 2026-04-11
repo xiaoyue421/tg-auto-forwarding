@@ -468,85 +468,89 @@ export default dashboard;
 
           </article>
 
-          <article v-show="ui.activeTab === 'sites'" class="panel">
+          <article v-show="ui.activeTab === 'sites'" class="panel hdhive-sites-panel">
             <div class="panel-head panel-head-wrap">
               <div>
                 <h2>HDHive（hdhive.com）</h2>
-                <p class="panel-subtext">
-                  <strong>Premium</strong> 用户可使用开放接口
-                  <code>POST https://hdhive.com/api/open/checkin</code>，请求头 <code>X-API-Key</code>。
-                  <strong>非 Premium</strong> 用户无此 Key，需在浏览器登录站点后，从开发者工具里复制 Cookie、<code>Next-Action</code>、<code>Next-Router-State-Tree</code>
-                  请求头，走与网页相同的 Next Server Action 签到（正文为 <code>[false]</code> / 博弈 <code>[true]</code>）。站点或框架更新后上述头可能失效，需重新复制。
-                  自动签到由 Web 进程按本地日期每天最多尝试一次。修改后请点「保存配置」。
+                <p class="panel-subtext hdhive-panel-intro">
+                  自上而下：签到方式 → 敏感凭证（默认折叠；含 Key、Cookie，Cookie 模式含 Next 头）→ 自动签到与转发策略。Key / Cookie 用途不变。修改后请点「保存配置」。
                 </p>
               </div>
             </div>
             <div class="form-grid">
               <label class="span-2">
-                <span>签到方式</span>
-                <select v-model="config.hdhive_checkin_method" @change="onHdhiveCheckinMethodChange">
+                <span>签到方式（仅影响自动签到 / 测试签到所用通道）</span>
+                <select v-model="config.hdhive_checkin_method">
                   <option value="api_key">Premium — API Key（/api/open/checkin）</option>
                   <option value="cookie">非 Premium — Cookie + Next 头（POST 首页）</option>
                 </select>
               </label>
-              <label v-show="config.hdhive_checkin_method === 'api_key'" class="span-2 hdhive-api-key-block">
-                <span>API Key（请求头 X-API-Key）</span>
-                <input
-                  v-model="config.hdhive_api_key"
-                  :type="hdhiveApiKeyVisible ? 'text' : 'password'"
-                  autocomplete="off"
-                  placeholder="粘贴 hdhive 提供的 API Key"
-                />
-                <div class="hdhive-secret-actions">
-                  <button type="button" class="btn btn-secondary btn-small" @click="hdhiveApiKeyVisible = !hdhiveApiKeyVisible">
-                    {{ hdhiveApiKeyVisible ? '隐藏' : '显示' }}
-                  </button>
+
+              <div class="span-2 hdhive-privacy-credentials">
+                <div class="hdhive-privacy-credentials-head">
+                  <span class="hdhive-privacy-credentials-title">敏感凭证（隐私）</span>
                 </div>
-              </label>
-              <template v-if="config.hdhive_checkin_method === 'cookie'">
-                <div v-if="!hdhiveSensitiveVisible" class="span-2 hdhive-secrets-collapsed">
+                <template v-if="!hdhiveCredentialsOpen">
                   <p class="panel-subtext">
-                    Cookie 与 Next 请求头已隐藏。点击下方可<strong>显示并编辑</strong>（或粘贴新值）；编辑完请「保存配置」。
+                    凭证已遮盖；保存仍写入已保存值。需在本页修改时请展开。
                   </p>
-                  <button type="button" class="btn btn-secondary btn-small" @click="hdhiveSensitiveVisible = true">
-                    显示并编辑
+                  <button type="button" class="btn btn-secondary btn-small" @click="hdhiveCredentialsOpen = true">
+                    显示并编辑敏感凭证
                   </button>
-                </div>
+                </template>
                 <template v-else>
-                  <div class="span-2 hdhive-secret-toolbar">
-                    <button type="button" class="btn btn-secondary btn-small" @click="collapseHdhiveSecrets">
-                      隐藏敏感信息
-                    </button>
-                  </div>
+                  <label class="span-2 hdhive-api-key-block">
+                    <span>API Key（请求头 X-API-Key）</span>
+                    <input
+                      v-model="config.hdhive_api_key"
+                      type="text"
+                      autocomplete="off"
+                      spellcheck="false"
+                      placeholder="签到（Premium）、OpenAPI 解锁等"
+                    />
+                  </label>
                   <label class="span-2">
                     <span>Cookie（完整一行，如 token=…）</span>
                     <textarea
                       v-model="config.hdhive_cookie"
                       rows="3"
                       autocomplete="off"
-                      placeholder="从浏览器请求头复制 Cookie"
+                      spellcheck="false"
+                      placeholder="资源页直链、解析积分；Cookie 签到亦依赖此项"
                     ></textarea>
                   </label>
-                  <label class="span-2">
-                    <span>Next-Action</span>
-                    <input
-                      v-model="config.hdhive_next_action"
-                      type="text"
-                      autocomplete="off"
-                      placeholder="请求头 Next-Action 的值"
-                    />
-                  </label>
-                  <label class="span-2">
-                    <span>Next-Router-State-Tree</span>
-                    <textarea
-                      v-model="config.hdhive_next_router_state_tree"
-                      rows="2"
-                      autocomplete="off"
-                      placeholder="请求头 Next-Router-State-Tree 的值（可为 URL 编码字符串）"
-                    ></textarea>
-                  </label>
+                  <template v-if="config.hdhive_checkin_method === 'cookie'">
+                    <label class="span-2">
+                      <span>Next-Action</span>
+                      <input
+                        v-model="config.hdhive_next_action"
+                        type="text"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="请求头 Next-Action 的值"
+                      />
+                    </label>
+                    <label class="span-2">
+                      <span>Next-Router-State-Tree</span>
+                      <textarea
+                        v-model="config.hdhive_next_router_state_tree"
+                        rows="2"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="请求头 Next-Router-State-Tree 的值（可为 URL 编码字符串）"
+                      ></textarea>
+                    </label>
+                  </template>
+                  <div class="hdhive-secret-actions span-2">
+                    <button type="button" class="btn btn-ghost btn-small" @click="hdhiveCredentialsOpen = false">
+                      隐藏整块凭证区域
+                    </button>
+                  </div>
                 </template>
-              </template>
+              </div>
+              <p v-if="config.hdhive_checkin_method !== 'cookie'" class="panel-subtext span-2">
+                当前为 API Key 签到：仍可在上方「敏感凭证」中填写 Cookie，用于资源页解析。
+              </p>
               <label class="toggle span-2">
                 <input type="checkbox" v-model="config.hdhive_checkin_enabled" />
                 <span>开启自动每日签到（由 Web 服务后台轮询，每天最多尝试一次）</span>
@@ -563,6 +567,36 @@ export default dashboard;
                 勾选后，HDHive 请求与 Telegram 共用上方「系统与连接」里的<strong>单代理</strong>（<code>TG_PROXY_*</code>）：支持
                 <code>http</code> / <code>https</code> / <code>socks5</code> / <code>socks4</code>，无需再单独改类型。
               </p>
+
+              <div class="span-2 sites-hdhive-unlock-block">
+                <h3 class="sites-hdhive-unlock-title">转发：HDHive 积分解锁</h3>
+                <p class="panel-subtext">
+                  与<strong>规则</strong>里「HDHive 专用直链转发」配合：<strong>优先</strong>用 Cookie 做免积分的 <code>/resource/</code> 直链解析；<strong>仅当失败</strong>且勾选下方开关时，再按积分上限用 OpenAPI 解锁（可能消耗积分）。上限与 MediaSync 的
+                  <code>subscription_hdhive_unlock_max_points_per_item</code> 一致：填 <strong>4</strong> 表示仅当页面解析到的所需积分 ≤ 4（含 4）时才自动解锁；<strong>0</strong> 表示不限制。
+                </p>
+              </div>
+              <label class="toggle span-2">
+                <input type="checkbox" v-model="config.hdhive_resource_unlock_enabled" />
+                <span>启用积分解锁回退（解析失败时调用 OpenAPI，需配置 API Key）</span>
+              </label>
+              <label class="span-2">
+                <span>自动解锁积分上限（单条，0 = 不限制）</span>
+                <input
+                  v-model.number="config.hdhive_resource_unlock_max_points"
+                  type="number"
+                  min="0"
+                  step="1"
+                  inputmode="numeric"
+                />
+              </label>
+              <label class="toggle span-2">
+                <input type="checkbox" v-model="config.hdhive_resource_unlock_threshold_inclusive" />
+                <span>上限包含边界（≤）；取消勾选则仅解锁严格小于上限的积分（&lt;）</span>
+              </label>
+              <label class="toggle span-2">
+                <input type="checkbox" v-model="config.hdhive_resource_unlock_skip_unknown_points" />
+                <span>无法从页面解析所需积分时跳过解锁（更保守）</span>
+              </label>
             </div>
             <div class="sites-checkin-hint panel-subtext">
                 <strong>测试签到</strong>：用当前表单中的 Key 或 Cookie/Next 头与「博弈模式」发请求，<strong>不必先保存</strong>；是否走代理以已保存的
@@ -588,11 +622,15 @@ export default dashboard;
               </button>
             </div>
 
-            <div class="sites-checkin-resolve">
+            <p class="panel-subtext span-2 sites-hdhive-preview-hint">
+              <strong>转发路径检测</strong>按<strong>已保存的 .env</strong>（Cookie、API Key、积分开关与上限）模拟转发器逻辑；<strong>不会</strong>调用
+              OpenAPI 解锁，不消耗积分。若刚改开关请先「保存配置」再测。
+            </p>
+            <div class="sites-checkin-resolve span-2">
               <input
                 v-model="hdhiveResolveTestUrl"
                 class="inline-input"
-                placeholder="解析测试：粘贴 hdhive.com/resource/...（不保存）"
+                placeholder="粘贴 hdhive.com/resource/115/... 或 /resource/… 完整链接"
               />
               <div class="sites-checkin-resolve-actions">
                 <button
@@ -600,13 +638,44 @@ export default dashboard;
                   :disabled="hdhiveResolveBusy"
                   @click="triggerHdhiveResolveTest"
                 >
-                  {{ hdhiveResolveBusy ? '解析中...' : '解析直链' }}
+                  {{ hdhiveResolveBusy ? '检测中...' : '检测转发路径' }}
                 </button>
               </div>
             </div>
-            <p v-if="hdhiveResolveResult" class="panel-subtext span-2" style="margin-top: 0.6rem; word-break: break-all">
-              <strong>redirect_url：</strong> <code>{{ hdhiveResolveResult }}</code>
-            </p>
+            <div v-if="hdhiveResolvePreview" class="sites-hdhive-preview span-2">
+              <div class="sites-hdhive-preview-head">
+                <span
+                  class="sites-hdhive-outcome"
+                  :class="'sites-hdhive-outcome--' + (hdhiveResolvePreview.outcome || 'fail')"
+                >
+                  {{ hdhiveOutcomeLabel }}
+                </span>
+                <p class="sites-hdhive-preview-summary">{{ hdhiveResolvePreview.summary }}</p>
+              </div>
+              <p v-if="hdhiveResolvePreview.openapi_preview?.note" class="sites-hdhive-preview-note panel-subtext">
+                {{ hdhiveResolvePreview.openapi_preview.note }}
+              </p>
+              <ul
+                v-if="hdhiveResolvePreview.detail_lines && hdhiveResolvePreview.detail_lines.length"
+                class="sites-hdhive-preview-lines"
+              >
+                <li v-for="(line, idx) in hdhiveResolvePreview.detail_lines" :key="idx">{{ line }}</li>
+              </ul>
+              <p
+                v-if="hdhiveResolveResult"
+                class="sites-hdhive-preview-redirect panel-subtext"
+              >
+                <strong>解析到的直链（Cookie NEXT_REDIRECT）：</strong>
+                <code>{{ hdhiveResolveResult }}</code>
+              </p>
+              <p v-if="hdhiveResolvePreview.slug" class="panel-subtext sites-hdhive-preview-meta">
+                资源 slug（用于 OpenAPI）：<code>{{ hdhiveResolvePreview.slug }}</code>
+                <template v-if="hdhiveResolvePreview.unlock_points != null">
+                  · 页面解析 unlock_points：<strong>{{ hdhiveResolvePreview.unlock_points }}</strong>
+                </template>
+                <template v-else> · 页面未解析到 unlock_points</template>
+              </p>
+            </div>
           </article>
 
           <article v-show="ui.activeTab === 'modules'" class="panel">

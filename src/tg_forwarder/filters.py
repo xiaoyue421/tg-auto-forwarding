@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 
@@ -8,12 +9,27 @@ from telethon.tl.custom.message import Message
 from tg_forwarder.config import CONTENT_MATCH_MODE_ANY, FilterConfig
 from tg_forwarder.hdhive_resource_resolve import (
     collect_hdhive_resource_urls_from_message,
+    extract_hdhive_resource_slug,
+    extract_unlock_points_from_hdhive_resource_html,
+    effective_hdhive_openapi_base_url,
+    load_hdhive_resource_page_text_sync,
     resolve_hdhive_resource_redirect_sync,
+    should_attempt_hdhive_openapi_unlock,
+    unlock_hdhive_resource_via_open_api_sync,
 )
 from tg_forwarder.message_index import extract_message_keyword_values, extract_message_text_values
 
 MATCH_VIA_NONE = "none"
 MATCH_VIA_MESSAGE = "message"
+_HDHIVE_UNLOCK_MISSING_KEY_WARNED = False
+
+
+def _parse_hdhive_unlock_max_points(values: dict[str, str]) -> int:
+    raw = (values.get("HDHIVE_RESOURCE_UNLOCK_MAX_POINTS") or "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 
 @dataclass(slots=True)
@@ -149,10 +165,19 @@ async def explain_message_match(
         )
 
     def _maybe_resolve_hdhive_override() -> str | None:
-        """When enabled and resource URL present:
-        - success: return redirect_url
-        - failure: return '链接失效' or 'HDHive 链接无权获取' (do not fall back to forwarding original message)
-        - no resource url present: return None (normal behavior)
+        """HDHive ``/resource/115/{slug}`` 等链接的转发正文替换逻辑（需规则开启「HDHive 专用直链转发」）。
+
+        流程与「先判免费 / 再解锁 / 再取直连」一致：
+
+        1. **判免费**：用 ``HDHIVE_COOKIE`` GET 资源页，解析 ``NEXT_REDIRECT`` → 得到 115cdn 等**直连**则
+           **立即返回**（不消耗积分，不调用 OpenAPI）。
+        2. **判积分解锁**：页内解析 ``unlock_points`` / ``points_required`` / 中文「需要使用 N 积分解锁」等；
+           与站点「自动解锁积分上限」比较；未开启解锁、超上限、未知积分且保守策略 → 跳过解锁分支。
+        3. **需解锁时**：``POST`` OpenAPI ``/api/open/resources/unlock``（body: ``{"slug":...}``，头 ``X-API-Key``）。
+           成功后 **再次** 用同一 Cookie GET 同一资源 URL，解析 **NEXT_REDIRECT 直连**；若仍无则回退
+           接口返回的分享链接。
+
+        失败时返回固定中文提示字符串（不回落为原始消息）。无 resource URL 时返回 ``None``。
         """
         if not bool(getattr(filters, "hdhive_resource_resolve_forward", False)):
             return None
@@ -160,37 +185,140 @@ async def explain_message_match(
 
         values = env_values if env_values is not None else dict(os.environ)
         cookie = (values.get("HDHIVE_COOKIE") or "").strip()
+        api_key = (values.get("HDHIVE_API_KEY") or "").strip()
+        unlock_enabled = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_ENABLED")
+        unlock_max_points = _parse_hdhive_unlock_max_points(values)
+        unlock_inclusive = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_THRESHOLD_INCLUSIVE", default=True)
+        unlock_skip_unknown = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS", default=False)
+        if unlock_enabled and not api_key:
+            global _HDHIVE_UNLOCK_MISSING_KEY_WARNED
+            if not _HDHIVE_UNLOCK_MISSING_KEY_WARNED:
+                logging.getLogger("tg_forwarder.hdhive").warning(
+                    "已开启 HDHIVE_RESOURCE_UNLOCK_ENABLED，但未配置 HDHIVE_API_KEY；"
+                    "将跳过积分解锁，仅尝试 Cookie 解析直链。"
+                )
+                _HDHIVE_UNLOCK_MISSING_KEY_WARNED = True
         urls = collect_hdhive_resource_urls_from_message(message, max_urls=3)
         if not urls:
             return None
-        if not cookie:
-            # No cookie means we cannot access redirect_url (usually requires logged-in permission).
-            return "HDHive 链接无权获取"
         from tg_forwarder.config import parse_proxy_from_env
 
-        proxy = None
-        if str(values.get("HDHIVE_CHECKIN_USE_PROXY") or "").strip().lower() in {"1", "true", "yes", "y", "on"}:
-            try:
-                proxy = parse_proxy_from_env(values)
-            except Exception:
-                proxy = None
+        try:
+            system_proxy = parse_proxy_from_env(values)
+        except Exception:
+            system_proxy = None
+        has_system_proxy = bool(system_proxy and str(system_proxy.host or "").strip())
+        # 资源页 GET：仅当勾选「通过代理访问 HDHive」时走代理
+        resolve_proxy = system_proxy if (_env_bool(values, "HDHIVE_CHECKIN_USE_PROXY") and has_system_proxy) else None
+        # OpenAPI 解锁：与常见 PHP 脚本一致，只要配置了 TG_PROXY_* 即走系统代理（不必同时勾选 HDHive 走代理）
+        unlock_proxy = system_proxy if has_system_proxy else None
 
+        any_permission_error = False
+        any_invalid_error = False
+        any_unlock_error = False
+        any_unlock_skipped_over_points = False
+        any_unlock_skipped_unknown_points = False
+        openapi_base = effective_hdhive_openapi_base_url(values)
         for url in urls:
-            ok, redirect_url, err = resolve_hdhive_resource_redirect_sync(
-                url,
-                cookie_header=cookie,
-                proxy=proxy,
-                timeout_seconds=30.0,
-            )
-            if ok and redirect_url.strip():
-                return redirect_url.strip()
-            err_text = (err or "").strip()
-            # Permission-like errors should be surfaced clearly.
-            if err_text.startswith("HTTP错误:"):
-                code = err_text.replace("HTTP错误:", "").strip()
-                if code in {"401", "403"}:
-                    return "HDHive 链接无权获取"
+            page_text = ""
+            # --- ① 免费：Cookie 拉页 → 有 NEXT_REDIRECT 即直连转发 ---
+            if cookie:
+                ok, redirect_url, err, page_text = resolve_hdhive_resource_redirect_sync(
+                    url,
+                    cookie_header=cookie,
+                    proxy=resolve_proxy,
+                    timeout_seconds=30.0,
+                )
+                if ok and redirect_url.strip():
+                    return redirect_url.strip()
+                err_text = (err or "").strip()
+                if err_text.startswith("HTTP错误:"):
+                    code = err_text.replace("HTTP错误:", "").strip().split(" ", 1)[0]
+                    if code in {"401", "403"}:
+                        any_permission_error = True
+                if "未找到重定向URL" in err_text or "HTTP错误: 404" in err_text:
+                    any_invalid_error = True
+
+            # --- ② 非直连：解析所需积分，对照上限后决定是否 OpenAPI 解锁 ---
+            if unlock_enabled and api_key:
+                slug = extract_hdhive_resource_slug(url)
+                if not slug:
+                    continue
+                unlock_points = extract_unlock_points_from_hdhive_resource_html(page_text)
+                if unlock_points is None and not (page_text or "").strip():
+                    probe_text, _probe_err = load_hdhive_resource_page_text_sync(
+                        url,
+                        cookie_header=cookie,
+                        proxy=resolve_proxy,
+                        timeout_seconds=30.0,
+                    )
+                    unlock_points = extract_unlock_points_from_hdhive_resource_html(probe_text)
+                allow_unlock, skip_reason = should_attempt_hdhive_openapi_unlock(
+                    unlock_points,
+                    max_points_per_item=unlock_max_points,
+                    threshold_inclusive=unlock_inclusive,
+                    skip_when_points_unknown=unlock_skip_unknown,
+                )
+                if not allow_unlock:
+                    if skip_reason == "over_threshold":
+                        any_unlock_skipped_over_points = True
+                    elif skip_reason == "unknown_points":
+                        any_unlock_skipped_unknown_points = True
+                    continue
+                # --- ③ POST 解锁 slug；成功后再次 GET 取 NEXT_REDIRECT 直连（优先于接口里的分享 URL）---
+                unlock_ok, share_link, unlock_err = unlock_hdhive_resource_via_open_api_sync(
+                    slug=slug,
+                    api_key=api_key,
+                    proxy=unlock_proxy,
+                    timeout_seconds=30.0,
+                    openapi_base_url=openapi_base,
+                )
+                if unlock_ok and share_link.strip():
+                    if cookie:
+                        ok_after, redirect_after, _err_after, _pt_after = (
+                            resolve_hdhive_resource_redirect_sync(
+                                url,
+                                cookie_header=cookie,
+                                proxy=resolve_proxy,
+                                timeout_seconds=30.0,
+                            )
+                        )
+                        if ok_after and redirect_after.strip():
+                            return redirect_after.strip()
+                    return share_link.strip()
+                if unlock_err:
+                    any_unlock_error = True
+
+        if not cookie and not (unlock_enabled and api_key):
+            return "HDHive 链接无权获取"
+        if any_permission_error:
+            return "HDHive 链接无权获取"
+        if any_invalid_error:
+            return "链接失效"
+        if any_unlock_skipped_over_points:
+            return "HDHive 积分解锁已跳过（超过设定上限）"
+        if any_unlock_skipped_unknown_points:
+            return "HDHive 积分解锁已跳过（无法从页面解析所需积分）"
+        if any_unlock_error:
+            return "HDHive 积分解锁失败"
         return "链接失效"
+
+    # Dedicated HDHive mode:
+    # - default: /resource/ links can trigger forwarding without keyword match
+    # - optional: require normal rule match (keywords/regex) before triggering
+    if bool(getattr(filters, "hdhive_resource_resolve_forward", False)):
+        urls = collect_hdhive_resource_urls_from_message(message, max_urls=3)
+        require_rule_match = bool(getattr(filters, "hdhive_require_rule_match", False))
+        if urls and not require_rule_match:
+            result = MessageMatchResult(
+                matched=True,
+                matched_via=MATCH_VIA_MESSAGE,
+                has_media=has_media,
+                has_text=has_text,
+                missing_content_parts=missing_content_parts,
+            )
+            result.dispatch_text_override = _maybe_resolve_hdhive_override()
+            return result
 
     has_pos = has_positive_primary_filters(filters)
     if not has_pos:
@@ -474,3 +602,10 @@ def dedupe_strings(values: list[str]) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _env_bool(values: dict[str, str], key: str, *, default: bool = False) -> bool:
+    raw = values.get(key)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}

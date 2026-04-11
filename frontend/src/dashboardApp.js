@@ -51,6 +51,10 @@ function createConfig() {
     hdhive_checkin_enabled: false,
     hdhive_checkin_gambler: false,
     hdhive_checkin_use_proxy: false,
+    hdhive_resource_unlock_enabled: false,
+    hdhive_resource_unlock_max_points: 0,
+    hdhive_resource_unlock_threshold_inclusive: true,
+    hdhive_resource_unlock_skip_unknown_points: false,
   };
 }
 
@@ -198,10 +202,9 @@ export default {
       hdhiveResolveBusy: false,
       hdhiveResolveTestUrl: "",
       hdhiveResolveResult: "",
-      /** Cookie / Next 头：默认隐藏，点击后再编辑 */
-      hdhiveSensitiveVisible: false,
-      /** API Key：密码框与显示切换 */
-      hdhiveApiKeyVisible: false,
+      hdhiveResolvePreview: null,
+      /** API Key / Cookie / Next 头：整块默认折叠（隐私）；展开后直接编辑，无二次显示隐藏 */
+      hdhiveCredentialsOpen: false,
       authBusy: false,
       authed: false,
       passwordInput: "",
@@ -398,6 +401,16 @@ export default {
     },
     detectionLogCount() {
       return this.sortedLogsForSourceScope.filter((item) => this.isDetectionLog(item)).length;
+    },
+    hdhiveOutcomeLabel() {
+      const o = this.hdhiveResolvePreview?.outcome;
+      const map = {
+        direct: "Cookie 直连（免积分）",
+        openapi: "将回退 OpenAPI 积分解锁",
+        fail: "直链不可用 / 不会自动解锁",
+        invalid_url: "链接无效",
+      };
+      return map[o] || "检测结果";
     },
     hdhiveCheckinLogCount() {
       return this.sortedLogsForSourceScope.filter((item) => this.isHdhiveCheckinLog(item)).length;
@@ -643,9 +656,17 @@ export default {
       const strategyLabel = this.getForwardStrategyLabel(
         response.data?.forward_strategy || this.config.forward_strategy,
       );
+      const matchedRule = String(response.data?.matched_rule || "").trim();
+      const usedTextOverride = Boolean(response.data?.used_text_override);
+      let ruleHint = "";
+      if (matchedRule) {
+        ruleHint = usedTextOverride
+          ? ` | \u5339\u914d\u89c4\u5219\u300c${matchedRule}\u300d\uff08\u5df2\u6309\u89e3\u6790\u6587\u672c/\u76f4\u94fe\u53d1\u9001\uff09`
+          : ` | \u5339\u914d\u89c4\u5219\u300c${matchedRule}\u300d\uff08\u539f\u6837\u8f6c\u53d1\uff09`;
+      }
       return summary.length
-        ? `${response.message} ${strategyLabel} | ${summary.join(" | ")}`
-        : `${response.message} ${strategyLabel}`;
+        ? `${response.message} ${strategyLabel} | ${summary.join(" | ")}${ruleHint}`
+        : `${response.message} ${strategyLabel}${ruleHint}`;
     },
     handleLogBoxScroll() {
       this.syncLogBoxState();
@@ -716,6 +737,16 @@ export default {
         hdhive_checkin_enabled: Boolean(payload.hdhive_checkin_enabled),
         hdhive_checkin_gambler: Boolean(payload.hdhive_checkin_gambler),
         hdhive_checkin_use_proxy: Boolean(payload.hdhive_checkin_use_proxy),
+        hdhive_resource_unlock_enabled: Boolean(payload.hdhive_resource_unlock_enabled),
+        hdhive_resource_unlock_max_points: Math.max(
+          0,
+          Math.floor(Number(payload.hdhive_resource_unlock_max_points) || 0),
+        ),
+        hdhive_resource_unlock_threshold_inclusive:
+          payload.hdhive_resource_unlock_threshold_inclusive !== false,
+        hdhive_resource_unlock_skip_unknown_points: Boolean(
+          payload.hdhive_resource_unlock_skip_unknown_points,
+        ),
         rules,
       };
     },
@@ -1601,6 +1632,10 @@ export default {
       this.config.rate_limit_delay_seconds = this.normalizeRateLimitDelayInput(
         this.config.rate_limit_delay_seconds,
       );
+      this.config.hdhive_resource_unlock_max_points = Math.max(
+        0,
+        Math.floor(Number(this.config.hdhive_resource_unlock_max_points) || 0),
+      );
       const rules = Array.isArray(this.config.rules)
         ? this.config.rules.map((rule, index) => this.normalizeRule(rule, index))
         : [createRule("rule_1")];
@@ -1633,6 +1668,14 @@ export default {
         hdhive_checkin_enabled: Boolean(this.config.hdhive_checkin_enabled),
         hdhive_checkin_gambler: Boolean(this.config.hdhive_checkin_gambler),
         hdhive_checkin_use_proxy: Boolean(this.config.hdhive_checkin_use_proxy),
+        hdhive_resource_unlock_enabled: Boolean(this.config.hdhive_resource_unlock_enabled),
+        hdhive_resource_unlock_max_points: this.config.hdhive_resource_unlock_max_points,
+        hdhive_resource_unlock_threshold_inclusive: Boolean(
+          this.config.hdhive_resource_unlock_threshold_inclusive,
+        ),
+        hdhive_resource_unlock_skip_unknown_points: Boolean(
+          this.config.hdhive_resource_unlock_skip_unknown_points,
+        ),
         rules,
       };
     },
@@ -1676,12 +1719,6 @@ export default {
         this.hdhiveCheckinBusy = false;
       }
     },
-    onHdhiveCheckinMethodChange() {
-      this.hdhiveSensitiveVisible = false;
-    },
-    collapseHdhiveSecrets() {
-      this.hdhiveSensitiveVisible = false;
-    },
     async triggerHdhiveCheckinTest() {
       this.hdhiveTestBusy = true;
       this.notice = "";
@@ -1710,6 +1747,7 @@ export default {
     async triggerHdhiveResolveTest() {
       this.hdhiveResolveBusy = true;
       this.hdhiveResolveResult = "";
+      this.hdhiveResolvePreview = null;
       this.notice = "";
       this.error = "";
       try {
@@ -1722,9 +1760,11 @@ export default {
           method: "POST",
           body: JSON.stringify({ url }),
         });
+        const preview = response.data?.preview ?? null;
+        this.hdhiveResolvePreview = preview && typeof preview === "object" ? preview : null;
         const got = String(response.data?.redirect_url ?? "").trim();
         this.hdhiveResolveResult = got;
-        this.notice = got ? "解析成功。" : response.message;
+        this.notice = String(response.message || "").trim() || "检测完成。";
       } catch (err) {
         this.error = this.normalizeCaughtError(err);
       } finally {
@@ -2013,6 +2053,7 @@ export default {
             target_chats: result.default_target_chats || "",
             bot_target_chats: result.default_bot_target_chats || "",
             forward_strategy: result.default_forward_strategy || "",
+            rule_names: Array.isArray(result.rules) ? result.rules : [],
           }),
         });
         const accountCount = Array.isArray(response.data?.account_targets) ? response.data.account_targets.length : 0;

@@ -351,6 +351,107 @@ body::before {
   padding: 18px;
 }
 
+/* HDHive: credential + check-in + unlock in one tab */
+.hdhive-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.hdhive-stack-section {
+  padding: 14px 14px 16px;
+  border: 1px solid rgba(16, 33, 39, 0.1);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.hdhive-section-title {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  letter-spacing: 0.01em;
+}
+
+.hdhive-privacy-credentials {
+  border: 1px solid rgba(16, 33, 39, 0.12);
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.hdhive-panel-intro {
+  max-width: 72ch;
+}
+
+.hdhive-inline-field-label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.hdhive-resolve-preview-card {
+  margin-top: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(16, 33, 39, 0.12);
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.hdhive-resolve-preview-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+@media (min-width: 640px) {
+  .hdhive-resolve-preview-head {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 10px;
+  }
+}
+
+.hdhive-resolve-outcome {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.hdhive-resolve-outcome--direct {
+  background: rgba(22, 163, 74, 0.14);
+  color: #166534;
+}
+
+.hdhive-resolve-outcome--openapi {
+  background: rgba(217, 119, 6, 0.16);
+  color: #9a3412;
+}
+
+.hdhive-resolve-outcome--fail,
+.hdhive-resolve-outcome--invalid_url {
+  background: rgba(220, 38, 38, 0.12);
+  color: #991b1b;
+}
+
+.hdhive-resolve-summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.hdhive-resolve-lines {
+  margin: 8px 0 0;
+  padding-left: 1.15rem;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
 .login-flow-panel {
   margin: 14px 0;
 }
@@ -1148,6 +1249,62 @@ textarea {
     padding: 10px 12px;
   }
 
+  /* HDHive 站点设置：小屏减少「盒中盒」与留白 */
+  .hdhive-settings-block {
+    padding: 14px 12px 16px;
+  }
+
+  .hdhive-settings-block .panel-subtext {
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .hdhive-stack {
+    gap: 10px;
+  }
+
+  .hdhive-stack-section {
+    padding: 10px 12px 12px;
+    border-radius: 14px;
+  }
+
+  .hdhive-section-title {
+    margin-bottom: 8px;
+    font-size: 13px;
+  }
+
+  .hdhive-stack-section .form-grid {
+    gap: 10px;
+  }
+
+  .hdhive-stack-section .toggle {
+    align-items: flex-start;
+  }
+
+  .hdhive-stack-section .toggle input {
+    flex-shrink: 0;
+    margin-top: 3px;
+  }
+
+  .hdhive-stack-section input,
+  .hdhive-stack-section textarea,
+  .hdhive-stack-section select {
+    padding: 11px 12px;
+  }
+
+  .hdhive-stack-section textarea {
+    min-height: 80px;
+  }
+
+  .hdhive-stack-section .inline-actions {
+    margin-top: 0;
+  }
+
+  .hdhive-stack-section .inline-toggle {
+    text-align: left;
+    line-height: 1.35;
+    word-break: break-word;
+  }
 }
 
 @media (min-width: 760px) {

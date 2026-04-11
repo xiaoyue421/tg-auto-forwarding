@@ -201,6 +201,7 @@ class RulePayload(BaseModel):
     regex_all: str = ""
     regex_block: str = ""
     hdhive_resource_resolve_forward: bool = False
+    hdhive_require_rule_match: bool = False
     media_only: bool = False
     text_only: bool = False
     content_match_mode: str = CONTENT_MATCH_MODE_ALL
@@ -262,6 +263,10 @@ class DashboardConfigPayload(BaseModel):
     hdhive_checkin_enabled: bool = False
     hdhive_checkin_gambler: bool = False
     hdhive_checkin_use_proxy: bool = False
+    hdhive_resource_unlock_enabled: bool = False
+    hdhive_resource_unlock_max_points: int = Field(default=0, ge=0)
+    hdhive_resource_unlock_threshold_inclusive: bool = True
+    hdhive_resource_unlock_skip_unknown_points: bool = False
 
     @field_validator("hdhive_checkin_method")
     @classmethod
@@ -334,6 +339,8 @@ class ManualForwardPayload(BaseModel):
     target_chats: str = ""
     bot_target_chats: str = ""
     forward_strategy: str = ""
+    # 来自消息搜索时传入「命中规则」列表；按顺序尝试，命中第一条规则后执行与自动转发相同的匹配与 HDHive 解析。
+    rule_names: list[str] = Field(default_factory=list)
 
     @field_validator("forward_strategy")
     @classmethod
@@ -827,6 +834,19 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                 hdhive_checkin_enabled=parse_bool_string(values.get("HDHIVE_CHECKIN_ENABLED")),
                 hdhive_checkin_gambler=parse_bool_string(values.get("HDHIVE_CHECKIN_GAMBLER")),
                 hdhive_checkin_use_proxy=parse_bool_string(values.get("HDHIVE_CHECKIN_USE_PROXY")),
+                hdhive_resource_unlock_enabled=parse_bool_string(values.get("HDHIVE_RESOURCE_UNLOCK_ENABLED")),
+                hdhive_resource_unlock_max_points=parse_non_negative_int_string(
+                    values.get("HDHIVE_RESOURCE_UNLOCK_MAX_POINTS"),
+                    default=0,
+                ),
+                hdhive_resource_unlock_threshold_inclusive=parse_bool_string(
+                    values.get("HDHIVE_RESOURCE_UNLOCK_THRESHOLD_INCLUSIVE"),
+                    default=True,
+                ),
+                hdhive_resource_unlock_skip_unknown_points=parse_bool_string(
+                    values.get("HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS"),
+                    default=False,
+                ),
             )
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
@@ -891,6 +911,14 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             "HDHIVE_CHECKIN_ENABLED": format_bool(payload.hdhive_checkin_enabled),
             "HDHIVE_CHECKIN_GAMBLER": format_bool(payload.hdhive_checkin_gambler),
             "HDHIVE_CHECKIN_USE_PROXY": format_bool(payload.hdhive_checkin_use_proxy),
+            "HDHIVE_RESOURCE_UNLOCK_ENABLED": format_bool(payload.hdhive_resource_unlock_enabled),
+            "HDHIVE_RESOURCE_UNLOCK_MAX_POINTS": str(int(payload.hdhive_resource_unlock_max_points)),
+            "HDHIVE_RESOURCE_UNLOCK_THRESHOLD_INCLUSIVE": format_bool(
+                payload.hdhive_resource_unlock_threshold_inclusive
+            ),
+            "HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS": format_bool(
+                payload.hdhive_resource_unlock_skip_unknown_points
+            ),
             "TG_LANDING_PAGE_ENABLED": None,
             "TG_LANDING_PAGE_MATCH_ENABLED": None,
             "TG_LANDING_PAGE_HOSTS": None,
@@ -1258,7 +1286,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
 
     @app.post("/api/hdhive/resolve-test")
     def hdhive_resolve_test(request: Request, payload: HdhiveResolveTestPayload) -> ApiResponse:
-        """Manual test: resolve one HDHive resource URL to redirect_url. Does NOT persist config."""
+        """检测单条 HDHive /resource/ 链接的转发路径（直连 vs 积分解锁策略）；不写入配置、不调用解锁接口。"""
         ensure_authenticated(request)
         ensure_env_config_path(resolved_config_path)
         values = read_env_file(resolved_config_path)
@@ -1266,24 +1294,48 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         if not url:
             raise HTTPException(status_code=400, detail="请填写 HDHive resource 链接")
         cookie = (values.get("HDHIVE_COOKIE") or "").strip()
-        if not cookie:
-            raise HTTPException(status_code=400, detail="请先在站点设置中填写 HDHIVE_COOKIE 并保存。")
+        api_key = (values.get("HDHIVE_API_KEY") or "").strip()
+        unlock_enabled = parse_bool_string(values.get("HDHIVE_RESOURCE_UNLOCK_ENABLED"))
+        unlock_max_points = parse_non_negative_int_string(
+            values.get("HDHIVE_RESOURCE_UNLOCK_MAX_POINTS"),
+            default=0,
+        )
+        unlock_inclusive = parse_bool_string(
+            values.get("HDHIVE_RESOURCE_UNLOCK_THRESHOLD_INCLUSIVE"),
+            default=True,
+        )
+        unlock_skip_unknown = parse_bool_string(
+            values.get("HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS"),
+            default=False,
+        )
         proxy, proxy_err = resolve_hdhive_proxy(values)
         if proxy_err:
             raise HTTPException(status_code=400, detail=translate_error(proxy_err))
-        from tg_forwarder.hdhive_resource_resolve import resolve_hdhive_resource_redirect_sync
+        from tg_forwarder.hdhive_resource_resolve import preview_hdhive_resource_forward_sync
 
-        ok, redirect_url, err = resolve_hdhive_resource_redirect_sync(
+        preview = preview_hdhive_resource_forward_sync(
             url,
-            cookie_header=cookie,
+            cookie=cookie,
+            api_key=api_key,
+            unlock_enabled=unlock_enabled,
+            unlock_max_points=unlock_max_points,
+            unlock_inclusive=unlock_inclusive,
+            unlock_skip_unknown=unlock_skip_unknown,
             proxy=proxy,
             timeout_seconds=30.0,
         )
-        if not ok:
-            raise HTTPException(status_code=502, detail=err or "解析失败")
+        redirect_url = ""
+        if preview.get("direct") and isinstance(preview["direct"], dict):
+            redirect_url = str(preview["direct"].get("redirect_url") or "").strip()
+        success = preview.get("outcome") == "direct" and bool(redirect_url)
+        msg = str(preview.get("summary") or "检测完成")
         return ApiResponse(
-            message="解析成功",
-            data={"success": True, "error": "", "redirect_url": redirect_url},
+            message=msg,
+            data={
+                "success": success,
+                "redirect_url": redirect_url,
+                "preview": preview,
+            },
         )
 
     @app.post("/api/forward/manual")
@@ -1297,6 +1349,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                 target_chats=payload.target_chats,
                 bot_target_chats=payload.bot_target_chats,
                 forward_strategy=payload.forward_strategy,
+                rule_names=payload.rule_names,
             )
             return ApiResponse(message="指定转发已执行。", data=result)
         except ConfigError as exc:
@@ -1356,6 +1409,7 @@ def build_legacy_rule(values: dict[str, str]) -> RulePayload:
         regex_all=normalize_regex_text(values.get("TG_REGEX_ALL", ""), "TG_REGEX_ALL"),
         regex_block=normalize_regex_text(values.get("TG_REGEX_BLOCK", ""), "TG_REGEX_BLOCK"),
         hdhive_resource_resolve_forward=parse_bool_string(values.get("TG_HDHIVE_RESOURCE_RESOLVE_FORWARD")),
+        hdhive_require_rule_match=parse_bool_string(values.get("TG_HDHIVE_REQUIRE_RULE_MATCH")),
         media_only=parse_bool_string(values.get("TG_MEDIA_ONLY")),
         text_only=parse_bool_string(values.get("TG_TEXT_ONLY")),
         content_match_mode=normalize_content_match_mode(
@@ -1411,6 +1465,7 @@ def rule_payload_from_dict(raw_rule: object, index: int) -> RulePayload:
         regex_all=keywords_to_text(filters.get("regex_all")),
         regex_block=keywords_to_text(filters.get("regex_block")),
         hdhive_resource_resolve_forward=bool(filters.get("hdhive_resource_resolve_forward", False)),
+        hdhive_require_rule_match=bool(filters.get("hdhive_require_rule_match", False)),
         media_only=bool(filters.get("media_only", False)),
         text_only=bool(filters.get("text_only", False)),
         content_match_mode=normalize_content_match_mode(
@@ -1512,6 +1567,7 @@ def serialize_rules_to_json(rules: list[RulePayload]) -> str:
                 "regex_all": split_regex_text(rule.regex_all),
                 "regex_block": split_regex_text(rule.regex_block),
                 "hdhive_resource_resolve_forward": bool(rule.hdhive_resource_resolve_forward),
+                "hdhive_require_rule_match": bool(rule.hdhive_require_rule_match),
                 "media_only": bool(rule.media_only),
                 "text_only": bool(rule.text_only),
                 "content_match_mode": rule.content_match_mode,
@@ -1542,6 +1598,15 @@ def parse_bool_string(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_non_negative_int_string(value: str | None, default: int = 0) -> int:
+    if value is None or not str(value).strip():
+        return default
+    try:
+        return max(0, int(str(value).strip(), 10))
+    except ValueError:
+        return default
 
 
 def format_bool(value: bool) -> str:

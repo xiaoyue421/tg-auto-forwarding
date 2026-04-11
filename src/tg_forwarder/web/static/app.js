@@ -18,6 +18,8 @@ function createRule(name = "rule_1") {
     regex_any: "",
     regex_all: "",
     regex_block: "",
+    hdhive_resource_resolve_forward: false,
+    hdhive_require_rule_match: false,
     resource_presets: [],
     media_only: false,
     text_only: false,
@@ -44,6 +46,18 @@ function createConfig() {
     proxy_password: "",
     proxy_rdns: true,
     search_default_mode: "fast",
+    hdhive_checkin_method: "api_key",
+    hdhive_api_key: "",
+    hdhive_cookie: "",
+    hdhive_next_action: "",
+    hdhive_next_router_state_tree: "",
+    hdhive_checkin_enabled: false,
+    hdhive_checkin_gambler: false,
+    hdhive_checkin_use_proxy: false,
+    hdhive_resource_unlock_enabled: false,
+    hdhive_resource_unlock_max_points: 0,
+    hdhive_resource_unlock_threshold_inclusive: true,
+    hdhive_resource_unlock_skip_unknown_points: false,
     rules: [createRule()],
   };
 }
@@ -237,10 +251,15 @@ createApp({
         ruleGroupFilter: "all",
         showSessionString: false,
         showBotToken: false,
+        hdhiveCredentialsOpen: false,
         logFilter: "monitor",
         showBackToTop: false,
         showLogBottom: false,
       },
+      hdhiveResolveBusy: false,
+      hdhiveResolveTestUrl: "",
+      hdhiveResolveResult: "",
+      hdhiveResolvePreview: null,
     };
   },
   computed: {
@@ -266,6 +285,16 @@ createApp({
         error: "错误",
       };
       return map[this.status.status] || "未知";
+    },
+    hdhiveOutcomeLabel() {
+      const o = this.hdhiveResolvePreview?.outcome;
+      const map = {
+        direct: "Cookie 直连（免积分）",
+        openapi: "将回退 OpenAPI 积分解锁",
+        fail: "直链不可用 / 不会自动解锁",
+        invalid_url: "链接无效",
+      };
+      return map[o] || "检测结果";
     },
     workerCards() {
       return this.status.snapshot?.workers || [];
@@ -564,9 +593,17 @@ createApp({
       const strategyLabel = this.getForwardStrategyLabel(
         response.data?.forward_strategy || this.config.forward_strategy,
       );
+      const matchedRule = String(response.data?.matched_rule || "").trim();
+      const usedTextOverride = Boolean(response.data?.used_text_override);
+      let ruleHint = "";
+      if (matchedRule) {
+        ruleHint = usedTextOverride
+          ? ` | \u5339\u914d\u89c4\u5219\u300c${matchedRule}\u300d\uff08\u5df2\u6309\u89e3\u6790\u6587\u672c/\u76f4\u94fe\u53d1\u9001\uff09`
+          : ` | \u5339\u914d\u89c4\u5219\u300c${matchedRule}\u300d\uff08\u539f\u6837\u8f6c\u53d1\uff09`;
+      }
       return summary.length
-        ? `${response.message} ${strategyLabel} | ${summary.join(" | ")}`
-        : `${response.message} ${strategyLabel}`;
+        ? `${response.message} ${strategyLabel} | ${summary.join(" | ")}${ruleHint}`
+        : `${response.message} ${strategyLabel}${ruleHint}`;
     },
     handleLogBoxScroll() {
       this.syncLogBoxState();
@@ -607,6 +644,8 @@ createApp({
         regex_any: this.normalizeMultilineText(rule.regex_any || ""),
         regex_all: this.normalizeMultilineText(rule.regex_all || ""),
         regex_block: this.normalizeMultilineText(rule.regex_block || ""),
+        hdhive_resource_resolve_forward: Boolean(rule.hdhive_resource_resolve_forward),
+        hdhive_require_rule_match: Boolean(rule.hdhive_require_rule_match),
         resource_presets: Array.from(new Set(normalizedPresets)),
       };
     },
@@ -808,6 +847,7 @@ createApp({
       count += this.splitRegexLines(rule.regex_any).length;
       count += this.splitRegexLines(rule.regex_all).length;
       count += this.splitRegexLines(rule.regex_block).length;
+      if (rule.hdhive_resource_resolve_forward) count += 1;
       count += Array.isArray(rule.resource_presets) ? rule.resource_presets.length : 0;
       if (rule.media_only) count += 1;
       if (rule.text_only) count += 1;
@@ -1106,6 +1146,33 @@ createApp({
         }
       }
     },
+    async triggerHdhiveResolveTest() {
+      this.hdhiveResolveBusy = true;
+      this.hdhiveResolveResult = "";
+      this.hdhiveResolvePreview = null;
+      this.notice = "";
+      this.error = "";
+      try {
+        const url = String(this.hdhiveResolveTestUrl ?? "").trim();
+        if (!url) {
+          this.error = "请先粘贴 hdhive.com/resource/... 链接。";
+          return;
+        }
+        const response = await this.fetchJson("/api/hdhive/resolve-test", {
+          method: "POST",
+          body: JSON.stringify({ url }),
+        });
+        const preview = response.data?.preview ?? null;
+        this.hdhiveResolvePreview = preview && typeof preview === "object" ? preview : null;
+        const got = String(response.data?.redirect_url ?? "").trim();
+        this.hdhiveResolveResult = got;
+        this.notice = String(response.message || "").trim() || "检测完成。";
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.hdhiveResolveBusy = false;
+      }
+    },
     async saveConfig(options = {}) {
       const successMessage = options.successMessage || "";
       const throwOnError = Boolean(options.throwOnError);
@@ -1115,6 +1182,10 @@ createApp({
       try {
         this.config.rate_limit_delay_seconds = this.normalizeRateLimitDelayInput(
           this.config.rate_limit_delay_seconds,
+        );
+        this.config.hdhive_resource_unlock_max_points = Math.max(
+          0,
+          Math.floor(Number(this.config.hdhive_resource_unlock_max_points) || 0),
         );
         const payload = {
           ...this.config,
@@ -1413,6 +1484,7 @@ createApp({
             target_chats: result.default_target_chats || "",
             bot_target_chats: result.default_bot_target_chats || "",
             forward_strategy: result.default_forward_strategy || "",
+            rule_names: Array.isArray(result.rules) ? result.rules : [],
           }),
         });
         const accountCount = Array.isArray(response.data?.account_targets) ? response.data.account_targets.length : 0;
@@ -1728,6 +1800,205 @@ createApp({
               </label>
             </div>
 
+            <div class="subpanel hdhive-settings-block">
+              <div class="panel-head compact-head">
+                <div>
+                  <h3>HDHive（hdhive.com）一站配置</h3>
+                  <p class="panel-subtext hdhive-panel-intro">
+                    自上而下：签到方式 → 敏感凭证（默认折叠；含 Key、Cookie，Cookie 签到时含 Next 头）→ 自动签到与转发策略。保存写入
+                    <code>.env</code>。
+                  </p>
+                </div>
+              </div>
+              <div class="hdhive-stack">
+                <section class="hdhive-stack-section" aria-labelledby="hdhive-method-heading">
+                  <h4 id="hdhive-method-heading" class="hdhive-section-title">1. 签到方式</h4>
+                  <div class="form-grid">
+                    <label class="span-2">
+                      <span>签到方式（仅影响自动签到 / 测试签到所用通道）</span>
+                      <select v-model="config.hdhive_checkin_method">
+                        <option value="api_key">Premium — API Key（/api/open/checkin）</option>
+                        <option value="cookie">非 Premium — Cookie + Next 请求头（与网页相同）</option>
+                      </select>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      只决定每日签到走 OpenAPI 还是 Next Action；与下方凭证填写无强制对应关系。
+                    </p>
+                  </div>
+                </section>
+
+                <section class="hdhive-stack-section hdhive-privacy-credentials" aria-labelledby="hdhive-cred-heading">
+                  <h4 id="hdhive-cred-heading" class="hdhive-section-title">2. 敏感凭证（隐私）</h4>
+                  <template v-if="!ui.hdhiveCredentialsOpen">
+                    <p class="panel-subtext span-2">
+                      凭证已遮盖；保存仍写入已配置值。需在本页修改时请展开。
+                    </p>
+                    <div class="inline-actions span-2">
+                      <button type="button" class="inline-toggle" @click="ui.hdhiveCredentialsOpen = true">显示并编辑敏感凭证</button>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="form-grid">
+                      <label class="span-2">
+                        <span>HDHive API Key（请求头 X-API-Key）</span>
+                        <input
+                          v-model="config.hdhive_api_key"
+                          type="text"
+                          autocomplete="off"
+                          spellcheck="false"
+                          placeholder="用于签到、积分解锁等"
+                        />
+                      </label>
+                      <label class="span-2">
+                        <span>HDHive Cookie（可选）</span>
+                        <textarea
+                          v-model="config.hdhive_cookie"
+                          rows="3"
+                          autocomplete="off"
+                          spellcheck="false"
+                          placeholder="完整 Cookie；资源页直链、unlock_points；Cookie 签到亦依赖此项"
+                        ></textarea>
+                      </label>
+                      <template v-if="config.hdhive_checkin_method === 'cookie'">
+                        <label class="span-2">
+                          <span>Next-Action</span>
+                          <input
+                            v-model="config.hdhive_next_action"
+                            type="text"
+                            autocomplete="off"
+                            spellcheck="false"
+                            placeholder="浏览器请求头 Next-Action 的值（站点更新后可能需重填）"
+                          />
+                        </label>
+                        <label class="span-2">
+                          <span>Next-Router-State-Tree</span>
+                          <textarea
+                            v-model="config.hdhive_next_router_state_tree"
+                            rows="2"
+                            autocomplete="off"
+                            spellcheck="false"
+                            placeholder="请求头 Next-Router-State-Tree（可为 URL 编码长串）"
+                          ></textarea>
+                        </label>
+                      </template>
+                      <div class="inline-actions span-2">
+                        <button type="button" class="inline-toggle" @click="ui.hdhiveCredentialsOpen = false">隐藏整块凭证区域</button>
+                      </div>
+                    </div>
+                  </template>
+                </section>
+
+                <section class="hdhive-stack-section" aria-labelledby="hdhive-checkin-heading">
+                  <h4 id="hdhive-checkin-heading" class="hdhive-section-title">3. 自动签到（可选）</h4>
+                  <div class="form-grid">
+                    <p v-if="config.hdhive_checkin_method !== 'cookie'" class="panel-subtext span-2">
+                      当前为 API Key 签到：仍可在上方「敏感凭证」中填写 Cookie，用于资源页解析。
+                    </p>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_checkin_enabled" />
+                      <span>开启自动每日签到（Web 进程按本地日期每天最多尝试一次）</span>
+                    </label>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_checkin_gambler" />
+                      <span>博弈模式签到（API Key 模式下 is_gambler: true，积分波动更大）</span>
+                    </label>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_checkin_use_proxy" />
+                      <span>访问 HDHive 走代理（使用下方「代理设置」里同一套单代理 TG_PROXY_*）</span>
+                    </label>
+                  </div>
+                </section>
+
+                <section class="hdhive-stack-section" aria-labelledby="hdhive-unlock-heading">
+                  <h4 id="hdhive-unlock-heading" class="hdhive-section-title">4. 转发 — 积分解锁策略</h4>
+                  <div class="form-grid">
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_resource_unlock_enabled" />
+                      <span>启用积分解锁回退（优先免积分 Cookie 直链；失败后再用 API Key 走 OpenAPI，可能消耗积分）</span>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      开启后须配置 API Key；否则日志会提示已开解锁但未配置 Key 并跳过。
+                    </p>
+                    <label>
+                      <span>自动解锁积分上限（单条）</span>
+                      <input
+                        type="number"
+                        min="0"
+                        step="1"
+                        v-model.number="config.hdhive_resource_unlock_max_points"
+                      />
+                    </label>
+                    <p class="panel-subtext span-2">
+                      0 表示不限制。填 4 表示仅当解析到的所需积分 ≤ 4（含 4）时才自动解锁。
+                    </p>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_resource_unlock_threshold_inclusive" />
+                      <span>上限包含边界（≤）；取消勾选则仅解锁严格小于上限的积分（&lt;）</span>
+                    </label>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_resource_unlock_skip_unknown_points" />
+                      <span>无法从页面解析所需积分时跳过解锁（更保守）</span>
+                    </label>
+                  </div>
+                </section>
+
+                <section class="hdhive-stack-section" aria-labelledby="hdhive-forward-test-heading">
+                  <h4 id="hdhive-forward-test-heading" class="hdhive-section-title">5. 转发路径检测（不耗积分）</h4>
+                  <p class="panel-subtext span-2">
+                    按<strong>已保存的 .env</strong> 模拟转发逻辑；<strong>不会</strong>调用 OpenAPI 解锁。改开关后请先保存配置。
+                  </p>
+                  <div class="form-grid span-2">
+                    <label class="span-2">
+                      <span>HDHive 资源链接</span>
+                      <input
+                        v-model="hdhiveResolveTestUrl"
+                        type="text"
+                        autocomplete="off"
+                        spellcheck="false"
+                        placeholder="https://hdhive.com/resource/115/..."
+                      />
+                    </label>
+                    <div class="inline-actions span-2">
+                      <button
+                        type="button"
+                        class="btn btn-secondary btn-small"
+                        :disabled="hdhiveResolveBusy"
+                        @click="triggerHdhiveResolveTest"
+                      >
+                        {{ hdhiveResolveBusy ? '检测中...' : '检测转发路径' }}
+                      </button>
+                    </div>
+                    <div v-if="hdhiveResolvePreview" class="span-2 hdhive-resolve-preview-card">
+                      <div class="hdhive-resolve-preview-head">
+                        <span
+                          class="hdhive-resolve-outcome"
+                          :class="'hdhive-resolve-outcome--' + (hdhiveResolvePreview.outcome || 'fail')"
+                        >
+                          {{ hdhiveOutcomeLabel }}
+                        </span>
+                        <p class="hdhive-resolve-summary">{{ hdhiveResolvePreview.summary }}</p>
+                      </div>
+                      <p v-if="hdhiveResolvePreview.openapi_preview && hdhiveResolvePreview.openapi_preview.note" class="panel-subtext">
+                        {{ hdhiveResolvePreview.openapi_preview.note }}
+                      </p>
+                      <ul v-if="hdhiveResolvePreview.detail_lines && hdhiveResolvePreview.detail_lines.length" class="hdhive-resolve-lines">
+                        <li v-for="(line, idx) in hdhiveResolvePreview.detail_lines" :key="idx">{{ line }}</li>
+                      </ul>
+                      <p v-if="hdhiveResolveResult" class="panel-subtext" style="word-break: break-all">
+                        <strong>直链：</strong><code>{{ hdhiveResolveResult }}</code>
+                      </p>
+                      <p v-if="hdhiveResolvePreview.slug" class="panel-subtext">
+                        slug：<code>{{ hdhiveResolvePreview.slug }}</code>
+                        <template v-if="hdhiveResolvePreview.unlock_points != null">
+                          · unlock_points <strong>{{ hdhiveResolvePreview.unlock_points }}</strong>
+                        </template>
+                      </p>
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </div>
+
             <div class="subpanel">
               <div class="panel-head compact-head">
                 <div>
@@ -1931,6 +2202,14 @@ createApp({
                         <span>{{ preset.label }}</span>
                       </label>
                     </div>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="rule.hdhive_require_rule_match" :disabled="!rule.hdhive_resource_resolve_forward" />
+                      <span>仅命中规则时才转发 HDHive（勾选后按关键词/正则命中执行）</span>
+                    </label>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="rule.hdhive_resource_resolve_forward" />
+                      <span>HDHive 专用直链转发（命中 hdhive.com/resource 即触发，不依赖关键词）</span>
+                    </label>
                     <label class="span-2">
                       <span>自定义正则：命中任一才转发</span>
                       <textarea
