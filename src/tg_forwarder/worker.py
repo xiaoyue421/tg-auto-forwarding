@@ -77,8 +77,8 @@ class ChannelWorker:
         if self._env_config_path is not None and self._env_config_path.is_file():
             self._env_values = read_env_file(self._env_config_path)
         self._message_hooks: MessageHookSet = (
-            load_message_hooks(env_cfg)
-            if env_cfg is not None and env_cfg.is_file()
+            load_message_hooks(self._env_config_path)
+            if self._env_config_path is not None and self._env_config_path.is_file()
             else MessageHookSet()
         )
         self._active_tasks: set[asyncio.Task[None]] = set()
