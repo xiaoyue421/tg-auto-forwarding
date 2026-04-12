@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from contextlib import suppress
 from typing import Callable
 
 from telethon import TelegramClient
@@ -11,6 +10,25 @@ from telethon.errors import FloodWaitError
 from telethon.errors.rpcerrorlist import UserMigrateError
 
 from tg_forwarder.config import ProxyConfig, TelegramSettings
+
+
+async def disconnect_telegram_client(
+    client: TelegramClient | None,
+    *,
+    logger: logging.Logger | None = None,
+    scope: str = "telegram client",
+) -> None:
+    """Await Telethon disconnect so internal recv tasks are not left pending (Python 3.12+ warns)."""
+    if client is None:
+        return
+    try:
+        if client.is_connected():
+            await asyncio.shield(client.disconnect())
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("%s: disconnect failed: %s", scope, exc, exc_info=True)
+    await asyncio.sleep(0)
+
 
 def build_telegram_client(
     *,
@@ -83,8 +101,7 @@ async def connect_client_with_proxy_pool(
                     exc.__class__.__name__,
                     extra={"monitor": True},
                 )
-            with suppress(Exception):
-                await client.disconnect()
+            await disconnect_telegram_client(client, logger=logger, scope=scope)
 
     if last_error is not None:
         raise last_error
@@ -143,8 +160,7 @@ async def start_bot_client_with_proxy_pool(
             except FloodWaitError as exc:
                 wait_s = int(getattr(exc, "seconds", 0) or 0)
                 last_error = exc
-                with suppress(Exception):
-                    await client.disconnect()
+                await disconnect_telegram_client(client, logger=logger, scope=scope)
                 if max_flood_sleep > 0 and wait_s > 0:
                     sleep_for = min(float(wait_s) + 1.5, max_flood_sleep)
                     if logger is not None:
@@ -173,8 +189,7 @@ async def start_bot_client_with_proxy_pool(
                 break
             except (UserMigrateError, asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
                 last_error = exc
-                with suppress(Exception):
-                    await client.disconnect()
+                await disconnect_telegram_client(client, logger=logger, scope=scope)
                 if logger is not None:
                     logger.warning(
                         "%s transient start failure via proxy #%s/%s (%s), retry %s/%s",
@@ -191,8 +206,7 @@ async def start_bot_client_with_proxy_pool(
                     continue
             except Exception as exc:
                 last_error = exc
-                with suppress(Exception):
-                    await client.disconnect()
+                await disconnect_telegram_client(client, logger=logger, scope=scope)
                 if logger is not None and (total > 1 or start_retries > 1):
                     logger.warning(
                         "%s failed via proxy #%s/%s (%s), attempt %s/%s",

@@ -18,6 +18,9 @@ build/
 .env.*
 !.env.example
 .hdhive_checkin_state.json
+# 本地 HDHive token，勿提交
+hdhive_cookies.json
+hdhive_cookies.txt
 config.yaml
 sessions/
 logs/

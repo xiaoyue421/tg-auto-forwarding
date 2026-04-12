@@ -7,17 +7,19 @@ import gzip
 import json
 import logging
 import random
+import re
+import sys
 import urllib.error
 import urllib.request
 from datetime import date
 from pathlib import Path
-from time import time
+from time import sleep, time
 from urllib.parse import quote
 
 import socks
 from sockshandler import SocksiPyHandler
 
-from tg_forwarder.config import ConfigError, ProxyConfig, parse_proxy_from_env
+from tg_forwarder.config import ConfigError, ProxyConfig, parse_proxy_from_env, parse_proxy_value
 from tg_forwarder.env_utils import read_env_file
 
 CHECKIN_URL_API = "https://hdhive.com/api/open/checkin"
@@ -31,6 +33,49 @@ DEFAULT_RETRY_JITTER_SEC = 15
 
 HDHIVE_METHOD_API_KEY = "api_key"
 HDHIVE_METHOD_COOKIE = "cookie"
+
+# Cookie 模式 POST https://hdhive.com/ 时，请求头 ``Next-Action`` / ``Next-Router-State-Tree`` 的默认写死值
+#（与浏览器 Network 里名称一致；若站点发版可改下面两常量，或用 .env 的 HDHIVE_CHECKIN_NEXT_* 覆盖）。
+# 使用处：``post_hdhive_checkin_cookie`` ← ``cookie_checkin_next_meta_from_env`` ← ``run_hdhive_checkin``。
+HDHIVE_DEFAULT_CHECKIN_NEXT_ACTION = "402b7e1f30165a6ded288e0043f2dbb11db4a998a1"
+HDHIVE_DEFAULT_CHECKIN_NEXT_ROUTER_STATE_TREE = (
+    "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+)
+
+
+def cookie_checkin_next_meta_from_env(values: dict[str, str] | None) -> tuple[str, str]:
+    """Cookie 签到用的 Next Server Action 元数据：优先读 .env，缺省用内置默认值。
+
+    站点发版后内置哈希可能与线上不一致，须在浏览器 Network 里复制本次签到请求的
+    ``Next-Action``、``Next-Router-State-Tree`` 填到 .env（见 ``HDHIVE_CHECKIN_NEXT_*``）。
+    仍兼容旧键名 ``HDHIVE_NEXT_ACTION`` / ``HDHIVE_NEXT_ROUTER_STATE_TREE``。
+    """
+    if not values:
+        return HDHIVE_DEFAULT_CHECKIN_NEXT_ACTION, HDHIVE_DEFAULT_CHECKIN_NEXT_ROUTER_STATE_TREE
+
+    def pick(*keys: str, default: str) -> str:
+        for k in keys:
+            v = (values.get(k) or "").strip()
+            if v:
+                return v
+        return default
+
+    return (
+        pick("HDHIVE_CHECKIN_NEXT_ACTION", "HDHIVE_NEXT_ACTION", default=HDHIVE_DEFAULT_CHECKIN_NEXT_ACTION),
+        pick(
+            "HDHIVE_CHECKIN_NEXT_ROUTER_STATE_TREE",
+            "HDHIVE_NEXT_ROUTER_STATE_TREE",
+            default=HDHIVE_DEFAULT_CHECKIN_NEXT_ROUTER_STATE_TREE,
+        ),
+    )
+
+
+def _normalize_hdhive_cookie_header_for_request(cookie_header: str) -> str:
+    """去掉首尾空白；若误把 ``Cookie:`` 前缀写进 .env 则剥掉。"""
+    ch = (cookie_header or "").strip()
+    if ch.lower().startswith("cookie:"):
+        ch = ch[7:].lstrip()
+    return ch
 
 
 def _env_bool(values: dict[str, str], key: str) -> bool:
@@ -67,7 +112,28 @@ def load_checkin_state_for_env(env_path: Path) -> dict[str, object]:
 
 
 def resolve_hdhive_proxy(values: dict[str, str]) -> tuple[ProxyConfig | None, str | None]:
-    """When HDHIVE_CHECKIN_USE_PROXY is set, return Telegram simple proxy or an error message."""
+    """解析 HDHive 出站 urllib 使用的代理（签到、Cookie 定时/立即刷新 GET 首页等共用本函数）。
+
+    规则顺序：
+
+    1. ``HDHIVE_CHECKIN_PROXY_URL`` / ``HDHIVE_CHECKIN_HTTP_PROXY`` 只要非空即使用（**不必**再开
+       ``HDHIVE_CHECKIN_USE_PROXY``），便于只给 HDHive 配 HTTP 代理而 Telegram 仍走 SOCKS。
+    2. 否则若 ``HDHIVE_CHECKIN_USE_PROXY`` 为真，则用 ``TG_PROXY_*`` 单代理（与控制台「系统与连接」一致）。
+    3. 以上均未启用则直连（``None``）。
+
+    经 SOCKS 访问 HTTPS 仍 ``SSL: UNEXPECTED_EOF`` 时，可用第 1 条填 ``http://127.0.0.1:7890`` 等。
+    """
+    override = (values.get("HDHIVE_CHECKIN_PROXY_URL") or values.get("HDHIVE_CHECKIN_HTTP_PROXY") or "").strip()
+    if override:
+        try:
+            proxy = parse_proxy_value(override, "HDHIVE_CHECKIN_PROXY_URL")
+        except ConfigError as exc:
+            return None, str(exc)
+        ptype = proxy.proxy_type.strip().lower()
+        if ptype == "mtproto":
+            return None, "HDHive 签到不支持 MTProto 代理，请改用 SOCKS5 或 HTTP 代理。"
+        return proxy, None
+
     if not _env_bool(values, "HDHIVE_CHECKIN_USE_PROXY"):
         return None, None
     try:
@@ -120,29 +186,56 @@ def _decode_response_body(data: bytes, _content_encoding: str = "") -> str:
     return data.decode("utf-8", errors="replace")
 
 
-def _urlopen_checkin(
+def _should_retry_urlopen_os_error(exc: OSError) -> bool:
+    """TLS 读一半被掐、超时、连接重置等可短暂重试（常见于网络抖动或需走代理）。"""
+    msg = str(exc).lower()
+    needles = (
+        "ssl",
+        "eof",
+        "connection reset",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "network is unreachable",
+    )
+    return any(n in msg for n in needles)
+
+
+def _urlopen_checkin_full(
     req: urllib.request.Request,
     opener: urllib.request.OpenerDirector | None = None,
-) -> tuple[int, str]:
+    *,
+    max_attempts: int = 3,
+) -> tuple[int, str, object]:
+    """返回 (http_code, body_text, response_headers)，供 Cookie 签到后从 Set-Cookie 合并 token。"""
     open_fn = opener.open if opener is not None else urllib.request.urlopen
-    try:
-        with open_fn(req, timeout=45) as resp:
-            raw = resp.read()
-            ce = ""
-            if hasattr(resp, "headers"):
-                ce = resp.headers.get("Content-Encoding", "") or ""
-            text = _decode_response_body(raw, ce)
-            return resp.getcode(), text
-    except urllib.error.HTTPError as exc:
+    last_exc: OSError | None = None
+    for attempt in range(1, max_attempts + 1):
         try:
-            raw = exc.read()
-            ce = exc.headers.get("Content-Encoding", "") if exc.headers else ""
-            text = _decode_response_body(raw, ce)
-        except OSError:
-            text = ""
-        return exc.code, text
-    except OSError as exc:
-        return -1, str(exc)
+            with open_fn(req, timeout=45) as resp:
+                raw = resp.read()
+                ce = ""
+                if hasattr(resp, "headers"):
+                    ce = resp.headers.get("Content-Encoding", "") or ""
+                text = _decode_response_body(raw, ce)
+                return resp.getcode(), text, resp.headers
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read()
+                ce = exc.headers.get("Content-Encoding", "") if exc.headers else ""
+                text = _decode_response_body(raw, ce)
+            except OSError:
+                text = ""
+            hdrs = exc.headers if exc.headers else {}
+            return exc.code, text, hdrs
+        except OSError as exc:
+            last_exc = exc
+            if attempt < max_attempts and _should_retry_urlopen_os_error(exc):
+                sleep(min(0.7 * attempt, 2.5))
+                continue
+            return -1, str(exc), {}
+    return -1, str(last_exc or OSError("unknown")), {}
 
 
 def _build_proxy_opener(
@@ -178,14 +271,14 @@ def _build_proxy_opener(
     raise ValueError(f"不支持的代理类型：{proxy.proxy_type}")
 
 
-def _urlopen_with_proxy(req: urllib.request.Request, proxy: ProxyConfig | None) -> tuple[int, str]:
+def _urlopen_with_proxy(req: urllib.request.Request, proxy: ProxyConfig | None) -> tuple[int, str, object]:
     if proxy is None:
-        return _urlopen_checkin(req, None)
+        return _urlopen_checkin_full(req, None)
     try:
         opener = _build_proxy_opener(proxy)
     except ValueError as exc:
-        return -1, str(exc)
-    return _urlopen_checkin(req, opener)
+        return -1, str(exc), {}
+    return _urlopen_checkin_full(req, opener)
 
 
 def post_hdhive_checkin_api(
@@ -201,7 +294,8 @@ def post_hdhive_checkin_api(
         headers["Content-Type"] = "application/json"
 
     req = urllib.request.Request(CHECKIN_URL_API, data=body if body else None, headers=headers, method="POST")
-    return _urlopen_with_proxy(req, proxy)
+    status, raw, _h = _urlopen_with_proxy(req, proxy)
+    return status, raw
 
 
 def post_hdhive_checkin_cookie(
@@ -210,54 +304,165 @@ def post_hdhive_checkin_cookie(
     next_router_state_tree: str,
     is_gambler: bool,
     proxy: ProxyConfig | None = None,
-) -> tuple[int, str]:
+) -> tuple[int, str, object]:
     """非 Premium：模拟站点 Next Server Action，POST 首页，正文为 [true]/[false]。"""
     body = b"[true]" if is_gambler else b"[false]"
+    cookie_value = _normalize_hdhive_cookie_header_for_request(cookie_header)
     headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "Cookie": cookie_header.strip(),
+        "Accept": "text/x-component, text/html, application/xhtml+xml, application/xml, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Cookie": cookie_value,
+        # 默认即文件顶部 HDHIVE_DEFAULT_CHECKIN_NEXT_*；可由 .env / CLI 覆盖后传入
         "Next-Action": next_action.strip(),
         "Next-Router-State-Tree": next_router_state_tree.strip(),
         "Origin": "https://hdhive.com",
         "Referer": "https://hdhive.com/",
-        "Accept-Language": "zh-CN,zh;q=0.9",
+        # 不显式发送 RSC:1：与浏览器里该次 Server Action POST 不一致时，服务端易返回整页 RSC。
+        "Next-Url": "/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-CH-UA": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         ),
     }
     req = urllib.request.Request(CHECKIN_URL_SITE, data=body, headers=headers, method="POST")
     return _urlopen_with_proxy(req, proxy)
 
 
+def _looks_like_nextjs_rsc_flight(text: str) -> bool:
+    """站点返回整页 RSC flight 时常含这些片段，而非单行 JSON 签到结果。"""
+    if not text or len(text) < 80:
+        return False
+    markers = (
+        "$Sreact",
+        "OutletBoundary",
+        "ViewportBoundary",
+        "MetadataBoundary",
+        '"children"',
+        "__PAGE__",
+    )
+    return sum(1 for m in markers if m in text) >= 3
+
+
+def _extract_message_from_rsc_dict(data: dict) -> tuple[str, str]:
+    """解析单行 flight JSON。HDHive 签到常见形如::
+
+        {"error": {"success": false, "message": "签到失败", "description": "你已经签到过了…", "code": "400"}}
+
+    也可能为顶层 message/description（无 error 包裹）。
+    """
+    err = data.get("error")
+    if isinstance(err, dict):
+        msg = str(err.get("message") or "").strip()
+        desc = str(err.get("description") or "").strip()
+        code = err.get("code")
+        if code is not None and str(code).strip():
+            code_s = str(code).strip()
+            if desc:
+                desc = f"{desc}（code={code_s}）"
+            elif msg:
+                desc = f"code={code_s}"
+        return msg, desc
+    return (
+        str(data.get("message") or "").strip(),
+        str(data.get("description") or "").strip(),
+    )
+
+
+def _json_loads_rsc_payload(payload: str) -> object | None:
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
+def _iter_digit_prefixed_json_dicts(text: str):
+    """解析 RSC flight 里 ``数字:`` 开头的块；若 JSON 跨多行则合并后再 ``json.loads``。
+
+    站点改版后可能出现 ``1:{"error":`` 与后续行拼成完整 JSON，原先按单行解析会失败并误判为「整页 RSC」。
+    """
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    digit_line = re.compile(r"^\s*\d+\s*:")
+    while i < n:
+        stripped = lines[i].strip()
+        if ":" not in stripped:
+            i += 1
+            continue
+        colon = stripped.find(":")
+        prefix = stripped[:colon].strip()
+        if not prefix.isdigit():
+            i += 1
+            continue
+        payload = stripped[colon + 1 :].lstrip()
+        merged = payload
+        j = i
+        data = _json_loads_rsc_payload(merged)
+        while data is None and j + 1 < n:
+            nxt = lines[j + 1]
+            if digit_line.match(nxt.strip()):
+                break
+            merged += "\n" + nxt
+            j += 1
+            data = _json_loads_rsc_payload(merged)
+            if len(merged) > 400_000:
+                break
+        next_i = j + 1 if j > i else i + 1
+        if isinstance(data, dict):
+            yield data
+        i = next_i
+
+
 def parse_hdhive_site_rsc_message(text: str) -> tuple[str, str]:
-    """从 text/x-component 响应体中解析以 ``1:`` 开头的行的 JSON，得到 (message, description)。"""
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line.startswith("1:"):
-            continue
-        colon = line.find(":")
-        json_str = line[colon + 1 :].strip() if colon >= 0 else ""
-        if not json_str:
-            continue
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        err = data.get("error")
-        if isinstance(err, dict):
-            return (
-                str(err.get("message") or "").strip(),
-                str(err.get("description") or "").strip(),
-            )
-        msg = str(data.get("message") or "").strip()
-        desc = str(data.get("description") or "").strip()
+    """从 text/x-component 响应体中解析 ``N:`` 前缀行的 JSON，得到 (message, description)。
+
+    示例（多行 flight，业务通常在 ``1:`` 行）::
+
+        0:{"a":"$@1","f":"","b":"CxQEnW-PurR3OXrwqibTd","q":"","i":false}
+        1:{"error":{"success":false,"message":"签到失败","description":"你已经签到过了，明天再来吧","code":"400"}}
+    """
+    if not (text or "").strip():
+        return "", ""
+
+    for data in _iter_digit_prefixed_json_dicts(text):
+        msg, desc = _extract_message_from_rsc_dict(data)
         if msg or desc:
-            return (msg, desc)
-    return ("", "")
+            return msg, desc
+        for key in ("result", "data", "actionResult"):
+            inner = data.get(key)
+            if isinstance(inner, dict):
+                msg, desc = _extract_message_from_rsc_dict(inner)
+                if msg or desc:
+                    return msg, desc
+
+    return "", ""
+
+
+def format_hdhive_cookie_checkin_display(
+    status: int, raw: str, msg: str, desc: str
+) -> tuple[str, str]:
+    """在无法解析到业务文案时，避免把整段 RSC flight 当作「提醒」展示给用户。"""
+    if (msg or desc).strip():
+        return msg, desc
+    if status > 0 and _looks_like_nextjs_rsc_flight(raw):
+        return (
+            "签到请求已返回，但正文是 Next.js 页面数据流（RSC），未包含可识别的签到结果。",
+            "请确认 HDHIVE_COOKIE（token）仍有效；若站点大改版导致内置 Next 元数据过期，需更新程序版本。",
+        )
+    if status > 0 and len(raw or "") > 400 and not (msg or desc):
+        return (
+            f"HTTP {status}，响应体未识别为签到 JSON（长度 {len(raw)} 字符）。",
+            "请确认 Cookie 有效；若站点已升级，可能需要更新程序内置的签到元数据。",
+        )
+    return msg, desc
 
 
 def parse_api_checkin_message(text: str) -> tuple[str, str]:
@@ -284,30 +489,33 @@ def run_hdhive_checkin(
     method: str,
     api_key: str,
     cookie_header: str,
-    next_action: str,
-    next_router_state_tree: str,
     is_gambler: bool,
     proxy: ProxyConfig | None,
-) -> tuple[int, str, str, str]:
+    hdhive_env: dict[str, str] | None = None,
+) -> tuple[int, str, str, str, object]:
     """
-    执行签到。返回 (http_status, raw_body, display_message, display_description)。
-    display_* 用于前端标题与正文；可能为空则前端回退 raw。
+    执行签到。返回 (http_status, raw_body, display_message, display_description, response_headers)。
+    Cookie 模式下 Next-Action / Next-Router-State-Tree 由 ``hdhive_env``（通常为 .env 键值）解析，
+    未配置时使用内置默认值；cookie 字符串勿带 ``Cookie:`` 前缀。
+    Cookie 模式下 response_headers 用于合并 Set-Cookie 中的 token；否则为空 dict。
     """
     m = normalize_hdhive_checkin_method(method)
     if m == HDHIVE_METHOD_COOKIE:
-        status, raw = post_hdhive_checkin_cookie(
+        next_action, next_router_tree = cookie_checkin_next_meta_from_env(hdhive_env)
+        status, raw, hdrs = post_hdhive_checkin_cookie(
             cookie_header,
             next_action,
-            next_router_state_tree,
+            next_router_tree,
             is_gambler,
             proxy,
         )
         msg, desc = parse_hdhive_site_rsc_message(raw) if status > 0 else ("", "")
-        return status, raw, msg, desc
+        msg, desc = format_hdhive_cookie_checkin_display(status, raw, msg, desc)
+        return status, raw, msg, desc, hdrs
 
     status, raw = post_hdhive_checkin_api(api_key, is_gambler, proxy)
     msg, desc = parse_api_checkin_message(raw) if status > 0 else ("", "")
-    return status, raw, msg, desc
+    return status, raw, msg, desc, {}
 
 
 def _env_int(values: dict[str, str], key: str, default: int, *, minimum: int = 0, maximum: int = 10_000) -> int:
@@ -351,14 +559,10 @@ def maybe_run_scheduled_checkin(env_path: Path, log: logging.Logger) -> None:
     method = normalize_hdhive_checkin_method(values.get("HDHIVE_CHECKIN_METHOD"))
     api_key = (values.get("HDHIVE_API_KEY") or "").strip()
     cookie_header = (values.get("HDHIVE_COOKIE") or "").strip()
-    next_action = (values.get("HDHIVE_NEXT_ACTION") or "").strip()
-    next_router = (values.get("HDHIVE_NEXT_ROUTER_STATE_TREE") or "").strip()
-
     if method == HDHIVE_METHOD_COOKIE:
-        if not cookie_header or not next_action or not next_router:
+        if not cookie_header:
             log.warning(
-                "HDHive 自动签到未执行：Cookie 模式需填写 HDHIVE_COOKIE、HDHIVE_NEXT_ACTION、"
-                "HDHIVE_NEXT_ROUTER_STATE_TREE 并保存。",
+                "HDHive 自动签到未执行：Cookie 模式需填写 HDHIVE_COOKIE（含 token=）并保存。",
             )
             return
     elif not api_key:
@@ -393,15 +597,19 @@ def maybe_run_scheduled_checkin(env_path: Path, log: logging.Logger) -> None:
     if next_retry_epoch > now_epoch:
         return
 
-    status, raw, msg, desc = run_hdhive_checkin(
+    status, raw, msg, desc, resp_hdrs = run_hdhive_checkin(
         method=method,
         api_key=api_key,
         cookie_header=cookie_header,
-        next_action=next_action,
-        next_router_state_tree=next_router,
         is_gambler=is_gambler,
         proxy=proxy,
+        hdhive_env=values,
     )
+    if method == HDHIVE_METHOD_COOKIE and resp_hdrs:
+        from tg_forwarder.hdhive_cookie_refresh import persist_hdhive_cookie_from_response_headers
+
+        if persist_hdhive_cookie_from_response_headers(env_path, cookie_header, resp_hdrs, log):
+            log.info("HDHive Cookie 已从签到响应 Set-Cookie 更新 token 并写回配置。")
     preview = (raw[:800] if raw else "") or f"{msg}: {desc}".strip()
     if msg or desc:
         line = "HDHive 自动签到 | HTTP %s | message=%s | description=%s"
@@ -453,3 +661,193 @@ async def hdhive_checkin_loop(stop: asyncio.Event, env_path: Path, log: logging.
             break
         except asyncio.TimeoutError:
             continue
+
+
+def _merge_cli_checkin_proxy(
+    values: dict[str, str],
+    *,
+    use_proxy: bool = False,
+    tg_proxy: str | None = None,
+    checkin_proxy_url: str | None = None,
+) -> dict[str, str]:
+    """命令行覆盖：与 .env 合并，用于本地单次测试而不必手改文件。"""
+    out = dict(values)
+    if use_proxy:
+        out["HDHIVE_CHECKIN_USE_PROXY"] = "true"
+    if tg_proxy and tg_proxy.strip():
+        p = parse_proxy_value(tg_proxy.strip(), "--tg-proxy")
+        out["HDHIVE_CHECKIN_USE_PROXY"] = "true"
+        out["TG_PROXY_TYPE"] = p.proxy_type
+        out["TG_PROXY_HOST"] = p.host
+        out["TG_PROXY_PORT"] = str(p.port)
+        out["TG_PROXY_USER"] = (p.username or "").strip()
+        out["TG_PROXY_PASSWORD"] = p.password if p.password is not None else ""
+        out["TG_PROXY_RDNS"] = "true" if p.rdns else "false"
+        out.pop("HDHIVE_CHECKIN_PROXY_URL", None)
+        out.pop("HDHIVE_CHECKIN_HTTP_PROXY", None)
+    if checkin_proxy_url and checkin_proxy_url.strip():
+        out["HDHIVE_CHECKIN_USE_PROXY"] = "true"
+        out["HDHIVE_CHECKIN_PROXY_URL"] = checkin_proxy_url.strip()
+    return out
+
+
+def _truncate_for_cli(text: str, max_chars: int) -> tuple[str, bool]:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text, False
+    return text[:max_chars], True
+
+
+def run_hdhive_checkin_once_from_env(
+    env_path: Path,
+    *,
+    use_proxy: bool = False,
+    tg_proxy: str | None = None,
+    checkin_proxy_url: str | None = None,
+    show_raw: bool = False,
+    show_raw_max: int = 80_000,
+    next_action: str | None = None,
+    next_router_state_tree: str | None = None,
+) -> int:
+    """
+    命令行单次签到：读 ``HDHIVE_CHECKIN_METHOD``、Cookie 或 API Key，不读写签到状态文件。
+    返回进程退出码：0=HTTP 200，1=HTTP 其它或业务失败，2=配置错误。
+
+    ``use_proxy`` / ``tg_proxy`` / ``checkin_proxy_url`` 仅用于 CLI，合并进配置后再解析代理；
+    与 ``resolve_hdhive_proxy`` 一致：未设 ``HDHIVE_CHECKIN_PROXY_URL`` 时使用 ``TG_PROXY_*``。
+
+    ``show_raw`` 为真时向 stdout 打印响应正文（便于调试 RSC / 解析失败）；默认不打印以免刷屏。
+    """
+    values = _merge_cli_checkin_proxy(
+        read_env_file(env_path),
+        use_proxy=use_proxy,
+        tg_proxy=tg_proxy,
+        checkin_proxy_url=checkin_proxy_url,
+    )
+    if next_action and next_action.strip():
+        values["HDHIVE_CHECKIN_NEXT_ACTION"] = next_action.strip()
+    if next_router_state_tree and next_router_state_tree.strip():
+        values["HDHIVE_CHECKIN_NEXT_ROUTER_STATE_TREE"] = next_router_state_tree.strip()
+    method = normalize_hdhive_checkin_method(values.get("HDHIVE_CHECKIN_METHOD"))
+    api_key = (values.get("HDHIVE_API_KEY") or "").strip()
+    cookie = (values.get("HDHIVE_COOKIE") or "").strip()
+    is_gambler = _env_bool(values, "HDHIVE_CHECKIN_GAMBLER")
+    proxy, proxy_err = resolve_hdhive_proxy(values)
+    if proxy_err:
+        print(proxy_err, file=sys.stderr)
+        return 2
+    if method == HDHIVE_METHOD_COOKIE:
+        if not cookie:
+            print("Cookie 模式需要 .env 中配置 HDHIVE_COOKIE（含 token=）。", file=sys.stderr)
+            return 2
+    elif not api_key:
+        print("API Key 模式需要 .env 中配置 HDHIVE_API_KEY。", file=sys.stderr)
+        return 2
+
+    status, raw, msg, desc, _hdrs = run_hdhive_checkin(
+        method=method,
+        api_key=api_key,
+        cookie_header=cookie,
+        is_gambler=is_gambler,
+        proxy=proxy,
+        hdhive_env=values,
+    )
+    print(f"HTTP {status}")
+    if msg:
+        print(f"message: {msg}")
+    if desc:
+        print(f"description: {desc}")
+    raw_len = len(raw or "")
+    if show_raw:
+        body, cut = _truncate_for_cli(raw or "", show_raw_max)
+        print(f"--- response body ({raw_len} chars{'，已截断' if cut else ''}) ---")
+        print(body)
+        print("--- end response body ---")
+    elif status >= 0 and raw_len and method == HDHIVE_METHOD_COOKIE:
+        print(f"response_bytes: {raw_len}（加 --show-raw 打印正文）", file=sys.stderr)
+    if status < 0:
+        print(raw, file=sys.stderr)
+        low = (raw or "").lower()
+        if "ssl" in low or "eof" in low or "certificate" in low:
+            print(
+                "提示：可在 .env 设置 HDHIVE_CHECKIN_USE_PROXY=true；若经 SOCKS 仍 SSL EOF，"
+                "请增设 HDHIVE_CHECKIN_PROXY_URL 为 HTTP 代理（如 http://127.0.0.1:7890），"
+                "仅覆盖签到请求，不必改 TG_PROXY_*。",
+                file=sys.stderr,
+            )
+        return 1
+    return 0 if status == 200 else 1
+
+
+def _cli_main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="HDHive 单次签到（读取 .env：HDHIVE_CHECKIN_METHOD、HDHIVE_COOKIE 或 HDHIVE_API_KEY）",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+        help=".env 路径（默认 ./.env）",
+    )
+    parser.add_argument(
+        "--use-proxy",
+        action="store_true",
+        help="本次运行强制开启「签到走代理」（等同 HDHIVE_CHECKIN_USE_PROXY=true，仍使用 .env 里 TG_PROXY_*）",
+    )
+    parser.add_argument(
+        "--tg-proxy",
+        metavar="URL",
+        default=None,
+        help="本次运行覆盖单代理（与控制台「代理设置」相同语义）：如 socks5://127.0.0.1:7893 或 http://127.0.0.1:7890；"
+        "会开启签到走代理并写入临时 TG_PROXY_*，且不使用 .env 里的 HDHIVE_CHECKIN_PROXY_URL",
+    )
+    parser.add_argument(
+        "--checkin-proxy-url",
+        metavar="URL",
+        default=None,
+        dest="checkin_proxy_url",
+        help="仅本次签到使用的代理 URL（等同 .env 的 HDHIVE_CHECKIN_PROXY_URL）；若与 --tg-proxy 同时指定，以本项为准",
+    )
+    parser.add_argument(
+        "--show-raw",
+        action="store_true",
+        help="将 HTTP 响应正文打印到 stdout（调试 RSC / 解析不到签到文案时使用；过长时由 --show-raw-max 截断）",
+    )
+    parser.add_argument(
+        "--show-raw-max",
+        type=int,
+        default=80_000,
+        metavar="N",
+        help="--show-raw 时最多输出字符数，0 表示不限制（默认 80000）",
+    )
+    parser.add_argument(
+        "--next-action",
+        metavar="HASH",
+        default=None,
+        help="覆盖本次签到的 Next-Action 请求头（与浏览器 Network 里一致；也可写进 .env 的 HDHIVE_CHECKIN_NEXT_ACTION）",
+    )
+    parser.add_argument(
+        "--next-router-state-tree",
+        metavar="ENCODED",
+        default=None,
+        help="覆盖本次签到的 Next-Router-State-Tree（与浏览器一致；也可写 .env 的 HDHIVE_CHECKIN_NEXT_ROUTER_STATE_TREE）",
+    )
+    args = parser.parse_args()
+    if not args.env_file.is_file():
+        print(f"找不到文件: {args.env_file.resolve()}", file=sys.stderr)
+        return 2
+    return run_hdhive_checkin_once_from_env(
+        args.env_file,
+        use_proxy=args.use_proxy,
+        tg_proxy=args.tg_proxy,
+        checkin_proxy_url=args.checkin_proxy_url,
+        show_raw=args.show_raw,
+        show_raw_max=max(0, args.show_raw_max),
+        next_action=args.next_action,
+        next_router_state_tree=args.next_router_state_tree,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli_main())

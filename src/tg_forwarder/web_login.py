@@ -5,6 +5,7 @@ import base64
 import io
 from contextlib import suppress
 from dataclasses import dataclass
+import logging
 from time import monotonic
 from typing import Any
 from uuid import uuid4
@@ -16,7 +17,11 @@ from telethon.sessions import StringSession
 
 from tg_forwarder import __version__ as TG_FORWARDER_VERSION
 from tg_forwarder.config import ConfigError, ProxyConfig, TelegramSettings
-from tg_forwarder.telegram_clients import build_telegram_client, connect_client_with_proxy_pool
+from tg_forwarder.telegram_clients import (
+    build_telegram_client,
+    connect_client_with_proxy_pool,
+    disconnect_telegram_client,
+)
 
 DEFAULT_LOGIN_TTL_SECONDS = 15 * 60
 
@@ -82,8 +87,11 @@ class TelegramWebLoginManager:
         try:
             await client.send_code_request(normalized_phone)
         except Exception:
-            with suppress(Exception):
-                await client.disconnect()
+            await disconnect_telegram_client(
+                client,
+                logger=logging.getLogger("tg_forwarder.web_login"),
+                scope="web login client (after send_code_request)",
+            )
             raise
 
         login_id = uuid4().hex
@@ -134,8 +142,11 @@ class TelegramWebLoginManager:
         try:
             qr = await client.qr_login()
         except Exception:
-            with suppress(Exception):
-                await client.disconnect()
+            await disconnect_telegram_client(
+                client,
+                logger=logging.getLogger("tg_forwarder.web_login"),
+                scope="web login client (after qr_login)",
+            )
             raise
 
         login_id = uuid4().hex
@@ -317,13 +328,13 @@ class TelegramWebLoginManager:
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+        log = logging.getLogger("tg_forwarder.web_login")
         for session in sessions:
             if session.qr_wait_task and not session.qr_wait_task.done():
                 session.qr_wait_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await session.qr_wait_task
-            with suppress(Exception):
-                await session.client.disconnect()
+            await disconnect_telegram_client(session.client, logger=log, scope="web login session (shutdown)")
 
     async def _get_session(self, login_id: str) -> PendingWebLogin:
         normalized_login_id = str(login_id or "").strip()
@@ -346,8 +357,11 @@ class TelegramWebLoginManager:
             session.qr_wait_task.cancel()
             with suppress(asyncio.CancelledError):
                 await session.qr_wait_task
-        with suppress(Exception):
-            await session.client.disconnect()
+        await disconnect_telegram_client(
+            session.client,
+            logger=logging.getLogger("tg_forwarder.web_login"),
+            scope="web login session",
+        )
 
     async def _cleanup_expired(self) -> None:
         expired_ids: list[str] = []

@@ -39,6 +39,7 @@ from tg_forwarder.monitoring import ForwardLogContext, build_targets_note, monit
 from tg_forwarder.telegram_clients import (
     build_telegram_client,
     connect_client_with_proxy_pool,
+    disconnect_telegram_client,
     start_bot_client_with_proxy_pool,
 )
 
@@ -62,6 +63,7 @@ def _find_worker_by_name(config: AppConfig, name: str) -> WorkerConfig | None:
 async def _resolve_manual_forward_rule_match(
     *,
     config: AppConfig,
+    config_path: str | Path,
     env_values: dict[str, str],
     message: Message,
     rule_names: list[str],
@@ -76,6 +78,7 @@ async def _resolve_manual_forward_rule_match(
             message,
             worker.filters,
             env_values=env_values,
+            env_config_path=config_path,
         )
         if match_result.matched:
             return match_result.dispatch_text_override, worker.name
@@ -245,8 +248,7 @@ async def _search_messages(
             item.pop("timestamp", None)
         return {"items": trimmed, "mode": search_mode}
     finally:
-        with suppress(Exception):
-            await client.disconnect()
+        await disconnect_telegram_client(client, logger=LOGGER, scope="dashboard search client")
 
 
 async def _manual_forward_message(
@@ -296,6 +298,7 @@ async def _manual_forward_message(
         if rules_in:
             text_override, matched_rule = await _resolve_manual_forward_rule_match(
                 config=config,
+                config_path=config_path,
                 env_values=env_values,
                 message=message,
                 rule_names=rules_in,
@@ -367,8 +370,7 @@ async def _manual_forward_message(
             "used_text_override": bool((text_override or "").strip()),
         }
     finally:
-        with suppress(Exception):
-            await user_client.disconnect()
+        await disconnect_telegram_client(user_client, logger=LOGGER, scope="manual forward user client")
         await close_bot_forward_contexts(bot_contexts)
 
 
@@ -653,8 +655,7 @@ async def build_bot_forward_contexts(
             )
             if not target_entities:
                 logger.warning("%s initialized in %s but has no accessible targets, skip", label, log_scope)
-                with suppress(Exception):
-                    await client.disconnect()
+                await disconnect_telegram_client(client, logger=logger, scope=f"{label} in {log_scope}")
                 continue
             contexts.append(
                 BotForwardContext(
@@ -667,15 +668,17 @@ async def build_bot_forward_contexts(
         except Exception:
             logger.exception("failed to initialize %s in %s", label, log_scope)
             if client is not None:
-                with suppress(Exception):
-                    await client.disconnect()
+                await disconnect_telegram_client(client, logger=logger, scope=f"{label} in {log_scope}")
     return contexts
 
 
 async def close_bot_forward_contexts(contexts: list[BotForwardContext]) -> None:
     for context in contexts:
-        with suppress(Exception):
-            await context.client.disconnect()
+        await disconnect_telegram_client(
+            context.client,
+            logger=LOGGER,
+            scope=f"{context.label} bot forward context",
+        )
 
 
 async def resolve_targets(

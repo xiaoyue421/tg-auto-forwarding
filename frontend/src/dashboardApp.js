@@ -17,6 +17,7 @@ function createRule(name = "rule_1") {
     regex_all: "",
     regex_block: "",
     hdhive_resource_resolve_forward: false,
+    hdhive_require_rule_match: false,
     media_only: false,
     text_only: false,
     content_match_mode: "all",
@@ -46,8 +47,6 @@ function createConfig() {
     hdhive_checkin_method: "api_key",
     hdhive_api_key: "",
     hdhive_cookie: "",
-    hdhive_next_action: "",
-    hdhive_next_router_state_tree: "",
     hdhive_checkin_enabled: false,
     hdhive_checkin_gambler: false,
     hdhive_checkin_use_proxy: false,
@@ -55,6 +54,8 @@ function createConfig() {
     hdhive_resource_unlock_max_points: 0,
     hdhive_resource_unlock_threshold_inclusive: true,
     hdhive_resource_unlock_skip_unknown_points: false,
+    hdhive_cookie_refresh_enabled: false,
+    hdhive_cookie_refresh_interval_sec: 1800,
   };
 }
 
@@ -198,6 +199,7 @@ export default {
       validating: false,
       actionBusy: false,
       hdhiveCheckinBusy: false,
+      hdhiveRefreshCookieBusy: false,
       hdhiveTestBusy: false,
       hdhiveResolveBusy: false,
       hdhiveResolveTestUrl: "",
@@ -704,6 +706,7 @@ export default {
         regex_all: this.normalizeMultilineText(rule.regex_all || ""),
         regex_block: this.normalizeMultilineText(rule.regex_block || ""),
         hdhive_resource_resolve_forward: Boolean(rule.hdhive_resource_resolve_forward),
+        hdhive_require_rule_match: Boolean(rule.hdhive_require_rule_match),
       };
     },
     normalizeSourceItems(value) {
@@ -732,8 +735,6 @@ export default {
         hdhive_checkin_method: String(payload.hdhive_checkin_method ?? "api_key").trim() || "api_key",
         hdhive_api_key: String(payload.hdhive_api_key ?? "").trim(),
         hdhive_cookie: String(payload.hdhive_cookie ?? "").trim(),
-        hdhive_next_action: String(payload.hdhive_next_action ?? "").trim(),
-        hdhive_next_router_state_tree: String(payload.hdhive_next_router_state_tree ?? "").trim(),
         hdhive_checkin_enabled: Boolean(payload.hdhive_checkin_enabled),
         hdhive_checkin_gambler: Boolean(payload.hdhive_checkin_gambler),
         hdhive_checkin_use_proxy: Boolean(payload.hdhive_checkin_use_proxy),
@@ -1636,6 +1637,10 @@ export default {
         0,
         Math.floor(Number(this.config.hdhive_resource_unlock_max_points) || 0),
       );
+      this.config.hdhive_cookie_refresh_interval_sec = Math.max(
+        60,
+        Math.min(86400, Math.floor(Number(this.config.hdhive_cookie_refresh_interval_sec) || 1800)),
+      );
       const rules = Array.isArray(this.config.rules)
         ? this.config.rules.map((rule, index) => this.normalizeRule(rule, index))
         : [createRule("rule_1")];
@@ -1663,8 +1668,6 @@ export default {
         hdhive_checkin_method: String(this.config.hdhive_checkin_method ?? "api_key").trim() || "api_key",
         hdhive_api_key: String(this.config.hdhive_api_key ?? "").trim(),
         hdhive_cookie: String(this.config.hdhive_cookie ?? "").trim(),
-        hdhive_next_action: String(this.config.hdhive_next_action ?? "").trim(),
-        hdhive_next_router_state_tree: String(this.config.hdhive_next_router_state_tree ?? "").trim(),
         hdhive_checkin_enabled: Boolean(this.config.hdhive_checkin_enabled),
         hdhive_checkin_gambler: Boolean(this.config.hdhive_checkin_gambler),
         hdhive_checkin_use_proxy: Boolean(this.config.hdhive_checkin_use_proxy),
@@ -1676,8 +1679,18 @@ export default {
         hdhive_resource_unlock_skip_unknown_points: Boolean(
           this.config.hdhive_resource_unlock_skip_unknown_points,
         ),
+        hdhive_cookie_refresh_enabled: Boolean(this.config.hdhive_cookie_refresh_enabled),
+        hdhive_cookie_refresh_interval_sec: this.config.hdhive_cookie_refresh_interval_sec,
         rules,
       };
+    },
+    _looksLikeHdhiveRscBody(text) {
+      const s = typeof text === "string" ? text : String(text ?? "");
+      if (s.length < 60) {
+        return false;
+      }
+      const keys = ["$Sreact", "OutletBoundary", "ViewportBoundary", "MetadataBoundary", "__PAGE__"];
+      return keys.filter((k) => s.includes(k)).length >= 2;
     },
     _hdhiveCheckinNoticeFromResponse(response) {
       const title = String(response.data?.checkin_message ?? "").trim();
@@ -1691,18 +1704,34 @@ export default {
       if (desc) {
         return desc;
       }
-      const body = response.data?.body || "";
+      const bodyRaw = response.data?.body ?? "";
+      const bodyStr = typeof bodyRaw === "string" ? bodyRaw : String(bodyRaw ?? "");
+      if (this._looksLikeHdhiveRscBody(bodyStr)) {
+        return (
+          String(response.message || "").trim() ||
+          "服务端返回了 Next.js 页面数据流（RSC），已隐藏原始正文。请更新并保存 HDHIVE_COOKIE；若站点大改版，需更新程序内置签到元数据。"
+        );
+      }
       let parsed = null;
       try {
-        parsed = JSON.parse(body);
+        parsed = JSON.parse(bodyStr);
       } catch (_e) {
         parsed = null;
       }
-      return (
-        (parsed && (parsed.message || parsed.data?.message)) ||
-        (typeof body === "string" && body.slice(0, 240)) ||
-        response.message
-      );
+      const fromJson = parsed && (parsed.message || parsed.data?.message);
+      if (fromJson) {
+        return String(fromJson);
+      }
+      if (bodyStr.length > 0 && bodyStr.length <= 400) {
+        return bodyStr;
+      }
+      if (bodyStr.length > 400) {
+        return (
+          String(response.message || "").trim() ||
+          `响应较长（${bodyStr.length} 字符），未识别为 JSON；请查看日志或重试。`
+        );
+      }
+      return String(response.message || "").trim() || "";
     },
     async triggerHdhiveCheckinNow() {
       this.hdhiveCheckinBusy = true;
@@ -1710,13 +1739,33 @@ export default {
       this.error = "";
       try {
         const response = await this.fetchJson("/api/hdhive/checkin-now", { method: "POST" });
-        this.notice = String(
+        const notice = String(
           this._hdhiveCheckinNoticeFromResponse(response) || response.message || "已完成请求。",
         );
+        this.notice = notice;
+        if (notice.includes("已根据响应 Set-Cookie")) {
+          await this.fetchConfig();
+        }
       } catch (err) {
         this.error = this.normalizeCaughtError(err);
       } finally {
         this.hdhiveCheckinBusy = false;
+      }
+    },
+    async triggerHdhiveRefreshCookie() {
+      this.hdhiveRefreshCookieBusy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/hdhive/refresh-cookie", { method: "POST" });
+        this.notice = String(response.message || "已完成请求。");
+        if (response.data && response.data.updated) {
+          await this.fetchConfig();
+        }
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.hdhiveRefreshCookieBusy = false;
       }
     },
     async triggerHdhiveCheckinTest() {
@@ -1730,14 +1779,16 @@ export default {
             checkin_method: String(this.config.hdhive_checkin_method ?? "api_key").trim() || "api_key",
             api_key: String(this.config.hdhive_api_key ?? "").trim(),
             cookie: String(this.config.hdhive_cookie ?? "").trim(),
-            next_action: String(this.config.hdhive_next_action ?? "").trim(),
-            next_router_state_tree: String(this.config.hdhive_next_router_state_tree ?? "").trim(),
             is_gambler: Boolean(this.config.hdhive_checkin_gambler),
           }),
         });
-        this.notice = String(
+        const notice = String(
           this._hdhiveCheckinNoticeFromResponse(response) || response.message || "测试请求已完成。",
         );
+        this.notice = notice;
+        if (notice.includes("已根据响应 Set-Cookie")) {
+          await this.fetchConfig();
+        }
       } catch (err) {
         this.error = this.normalizeCaughtError(err);
       } finally {

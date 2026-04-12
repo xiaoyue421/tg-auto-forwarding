@@ -9,6 +9,7 @@ import os
 import re
 from dataclasses import asdict
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,12 @@ from tg_forwarder.hdhive_checkin import (
     normalize_hdhive_checkin_method,
     resolve_hdhive_proxy,
     run_hdhive_checkin,
+)
+from tg_forwarder.hdhive_cookie_refresh import (
+    _network_hint_for_message,
+    hdhive_cookie_refresh_loop,
+    maybe_refresh_hdhive_cookie,
+    persist_hdhive_cookie_from_response_headers,
 )
 from tg_forwarder.log_buffer import InMemoryLogHandler, create_dashboard_child_log_bridge
 from tg_forwarder.modules.loader import load_hooks_module_file
@@ -129,13 +136,11 @@ class LoginPayload(BaseModel):
 
 
 class HdhiveCheckinTestPayload(BaseModel):
-    """测试签到：优先使用请求体中的字段；未填则回退 .env。"""
+    """测试签到：优先使用请求体中的字段；未填则回退 .env。Cookie 模式签到使用程序内置 Next 元数据。"""
 
     checkin_method: str = ""
     api_key: str = ""
     cookie: str = ""
-    next_action: str = ""
-    next_router_state_tree: str = ""
     is_gambler: bool = False
 
 
@@ -258,8 +263,6 @@ class DashboardConfigPayload(BaseModel):
     hdhive_checkin_method: str = "api_key"
     hdhive_api_key: str = ""
     hdhive_cookie: str = ""
-    hdhive_next_action: str = ""
-    hdhive_next_router_state_tree: str = ""
     hdhive_checkin_enabled: bool = False
     hdhive_checkin_gambler: bool = False
     hdhive_checkin_use_proxy: bool = False
@@ -267,6 +270,8 @@ class DashboardConfigPayload(BaseModel):
     hdhive_resource_unlock_max_points: int = Field(default=0, ge=0)
     hdhive_resource_unlock_threshold_inclusive: bool = True
     hdhive_resource_unlock_skip_unknown_points: bool = False
+    hdhive_cookie_refresh_enabled: bool = False
+    hdhive_cookie_refresh_interval_sec: int = Field(default=1800, ge=60, le=86400)
 
     @field_validator("hdhive_checkin_method")
     @classmethod
@@ -294,17 +299,10 @@ def _validate_hdhive_checkin_config(payload: DashboardConfigPayload) -> None:
     if not payload.hdhive_checkin_enabled:
         return
     if method == "cookie":
-        missing: list[str] = []
         if not payload.hdhive_cookie.strip():
-            missing.append("Cookie")
-        if not payload.hdhive_next_action.strip():
-            missing.append("Next-Action")
-        if not payload.hdhive_next_router_state_tree.strip():
-            missing.append("Next-Router-State-Tree")
-        if missing:
             raise HTTPException(
                 status_code=400,
-                detail=f"自动签到已开启，Cookie 模式缺少：{', '.join(missing)}。",
+                detail="自动签到已开启，Cookie 模式需填写 HDHIVE_COOKIE（含 token=）。",
             )
         return
     if not payload.hdhive_api_key.strip():
@@ -485,22 +483,24 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     async def _startup_hdhive_checkin() -> None:
         stop = asyncio.Event()
         log = logging.getLogger("tg_forwarder.hdhive")
-        task = asyncio.create_task(hdhive_checkin_loop(stop, resolved_config_path, log))
+        task_checkin = asyncio.create_task(hdhive_checkin_loop(stop, resolved_config_path, log))
+        task_cookie = asyncio.create_task(hdhive_cookie_refresh_loop(stop, resolved_config_path, log))
         checkin_holder.clear()
-        checkin_holder.extend([stop, task])
+        checkin_holder.extend([stop, task_checkin, task_cookie])
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
         if checkin_holder:
-            stop, task = checkin_holder[0], checkin_holder[1]
+            stop = checkin_holder[0]
             if isinstance(stop, asyncio.Event):
                 stop.set()
-            if isinstance(task, asyncio.Task) and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            for item in checkin_holder[1:]:
+                if isinstance(item, asyncio.Task) and not item.done():
+                    item.cancel()
+                    try:
+                        await item
+                    except asyncio.CancelledError:
+                        pass
         child_log_listener.stop()
         await login_manager.close()
 
@@ -829,8 +829,6 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                 hdhive_checkin_method=normalize_hdhive_checkin_method(values.get("HDHIVE_CHECKIN_METHOD")),
                 hdhive_api_key=(values.get("HDHIVE_API_KEY") or "").strip(),
                 hdhive_cookie=(values.get("HDHIVE_COOKIE") or "").strip(),
-                hdhive_next_action=(values.get("HDHIVE_NEXT_ACTION") or "").strip(),
-                hdhive_next_router_state_tree=(values.get("HDHIVE_NEXT_ROUTER_STATE_TREE") or "").strip(),
                 hdhive_checkin_enabled=parse_bool_string(values.get("HDHIVE_CHECKIN_ENABLED")),
                 hdhive_checkin_gambler=parse_bool_string(values.get("HDHIVE_CHECKIN_GAMBLER")),
                 hdhive_checkin_use_proxy=parse_bool_string(values.get("HDHIVE_CHECKIN_USE_PROXY")),
@@ -846,6 +844,21 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                 hdhive_resource_unlock_skip_unknown_points=parse_bool_string(
                     values.get("HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS"),
                     default=False,
+                ),
+                hdhive_cookie_refresh_enabled=parse_bool_string(
+                    values.get("HDHIVE_COOKIE_REFRESH_ENABLED"),
+                    default=False,
+                ),
+                hdhive_cookie_refresh_interval_sec=max(
+                    60,
+                    min(
+                        86400,
+                        parse_non_negative_int_string(
+                            values.get("HDHIVE_COOKIE_REFRESH_INTERVAL_SEC"),
+                            default=1800,
+                        )
+                        or 1800,
+                    ),
                 ),
             )
         except ConfigError as exc:
@@ -906,8 +919,8 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             "HDHIVE_CHECKIN_METHOD": normalize_hdhive_checkin_method(payload.hdhive_checkin_method),
             "HDHIVE_API_KEY": quote_env_value(payload.hdhive_api_key.strip()),
             "HDHIVE_COOKIE": quote_env_value(payload.hdhive_cookie.strip()),
-            "HDHIVE_NEXT_ACTION": quote_env_value(payload.hdhive_next_action.strip()),
-            "HDHIVE_NEXT_ROUTER_STATE_TREE": quote_env_value(payload.hdhive_next_router_state_tree.strip()),
+            "HDHIVE_NEXT_ACTION": None,
+            "HDHIVE_NEXT_ROUTER_STATE_TREE": None,
             "HDHIVE_CHECKIN_ENABLED": format_bool(payload.hdhive_checkin_enabled),
             "HDHIVE_CHECKIN_GAMBLER": format_bool(payload.hdhive_checkin_gambler),
             "HDHIVE_CHECKIN_USE_PROXY": format_bool(payload.hdhive_checkin_use_proxy),
@@ -919,6 +932,8 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             "HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS": format_bool(
                 payload.hdhive_resource_unlock_skip_unknown_points
             ),
+            "HDHIVE_COOKIE_REFRESH_ENABLED": format_bool(payload.hdhive_cookie_refresh_enabled),
+            "HDHIVE_COOKIE_REFRESH_INTERVAL_SEC": str(int(payload.hdhive_cookie_refresh_interval_sec)),
             "TG_LANDING_PAGE_ENABLED": None,
             "TG_LANDING_PAGE_MATCH_ENABLED": None,
             "TG_LANDING_PAGE_HOSTS": None,
@@ -1194,14 +1209,10 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         )
         if method == "cookie":
             cookie = (payload.cookie or "").strip() or (values.get("HDHIVE_COOKIE") or "").strip()
-            next_action = (payload.next_action or "").strip() or (values.get("HDHIVE_NEXT_ACTION") or "").strip()
-            tree = (payload.next_router_state_tree or "").strip() or (
-                values.get("HDHIVE_NEXT_ROUTER_STATE_TREE") or ""
-            ).strip()
-            if not cookie or not next_action or not tree:
+            if not cookie:
                 raise HTTPException(
                     status_code=400,
-                    detail="Cookie 模式需填写 Cookie、Next-Action、Next-Router-State-Tree，或先保存配置后再测。",
+                    detail="Cookie 模式需填写 Cookie（或先在站点设置保存 HDHIVE_COOKIE）后再测。",
                 )
             api_key = ""
         else:
@@ -1212,20 +1223,17 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                     detail="Premium（API Key）模式需填写 API Key，或先保存配置后再测。",
                 )
             cookie = ""
-            next_action = ""
-            tree = ""
 
         proxy, proxy_err = resolve_hdhive_proxy(values)
         if proxy_err:
             raise HTTPException(status_code=400, detail=translate_error(proxy_err))
-        status, raw, msg, desc = run_hdhive_checkin(
+        status, raw, msg, desc, resp_hdrs = run_hdhive_checkin(
             method=method,
             api_key=api_key,
             cookie_header=cookie,
-            next_action=next_action,
-            next_router_state_tree=tree,
             is_gambler=bool(payload.is_gambler),
             proxy=proxy,
+            hdhive_env=values,
         )
         if status < 0:
             logging.getLogger("tg_forwarder.hdhive").warning(
@@ -1235,7 +1243,23 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             )
             raise HTTPException(status_code=502, detail=f"网络错误：{raw}")
         _log_hdhive_event("测试签到", method, status, msg, desc)
-        return _hdhive_checkin_api_response(status, raw, msg, desc)
+        hdhive_log = logging.getLogger("tg_forwarder.hdhive")
+        cookie_updated = bool(
+            method == "cookie"
+            and resp_hdrs
+            and persist_hdhive_cookie_from_response_headers(
+                resolved_config_path, cookie, resp_hdrs, hdhive_log
+            )
+        )
+        resp = _hdhive_checkin_api_response(status, raw, msg, desc)
+        if cookie_updated:
+            resp = resp.model_copy(
+                update={
+                    "message": (resp.message or "").strip()
+                    + " 已根据响应 Set-Cookie 更新 HDHIVE_COOKIE（请刷新页面加载最新配置）。"
+                }
+            )
+        return resp
 
     @app.post("/api/hdhive/checkin-now")
     def hdhive_checkin_now(request: Request) -> ApiResponse:
@@ -1245,34 +1269,29 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         method = normalize_hdhive_checkin_method(values.get("HDHIVE_CHECKIN_METHOD"))
         api_key = (values.get("HDHIVE_API_KEY") or "").strip()
         cookie = (values.get("HDHIVE_COOKIE") or "").strip()
-        next_action = (values.get("HDHIVE_NEXT_ACTION") or "").strip()
-        tree = (values.get("HDHIVE_NEXT_ROUTER_STATE_TREE") or "").strip()
         if method == "cookie":
-            if not cookie or not next_action or not tree:
+            if not cookie:
                 raise HTTPException(
                     status_code=400,
-                    detail="请先在站点设置中填写 Cookie、Next-Action、Next-Router-State-Tree 并保存。",
+                    detail="请先在站点设置中填写 HDHIVE_COOKIE（含 token=）并保存。",
                 )
             api_key = ""
         elif not api_key:
             raise HTTPException(status_code=400, detail="请先在站点设置中填写 HDHive API Key 并保存。")
         else:
             cookie = ""
-            next_action = ""
-            tree = ""
 
         is_gambler = parse_bool_string(values.get("HDHIVE_CHECKIN_GAMBLER"))
         proxy, proxy_err = resolve_hdhive_proxy(values)
         if proxy_err:
             raise HTTPException(status_code=400, detail=translate_error(proxy_err))
-        status, raw, msg, desc = run_hdhive_checkin(
+        status, raw, msg, desc, resp_hdrs = run_hdhive_checkin(
             method=method,
             api_key=api_key,
             cookie_header=cookie,
-            next_action=next_action,
-            next_router_state_tree=tree,
             is_gambler=is_gambler,
             proxy=proxy,
+            hdhive_env=values,
         )
         if status < 0:
             logging.getLogger("tg_forwarder.hdhive").warning(
@@ -1282,7 +1301,69 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             )
             raise HTTPException(status_code=502, detail=f"网络错误：{raw}")
         _log_hdhive_event("立即签到", method, status, msg, desc)
-        return _hdhive_checkin_api_response(status, raw, msg, desc)
+        hdhive_log = logging.getLogger("tg_forwarder.hdhive")
+        cookie_updated = bool(
+            method == "cookie"
+            and resp_hdrs
+            and persist_hdhive_cookie_from_response_headers(
+                resolved_config_path, cookie, resp_hdrs, hdhive_log
+            )
+        )
+        resp = _hdhive_checkin_api_response(status, raw, msg, desc)
+        if cookie_updated:
+            resp = resp.model_copy(
+                update={
+                    "message": (resp.message or "").strip()
+                    + " 已根据响应 Set-Cookie 更新 HDHIVE_COOKIE（请刷新页面加载最新配置）。"
+                }
+            )
+        return resp
+
+    @app.post("/api/hdhive/refresh-cookie")
+    async def hdhive_refresh_cookie_api(request: Request) -> ApiResponse:
+        """立即用当前 HDHIVE_COOKIE 请求首页并写回新 token（不依赖 HDHIVE_COOKIE_REFRESH_ENABLED）。"""
+        ensure_authenticated(request)
+        ensure_env_config_path(resolved_config_path)
+        log = logging.getLogger("tg_forwarder.hdhive")
+        values = read_env_file(resolved_config_path)
+        cookie = (values.get("HDHIVE_COOKIE") or "").strip()
+        if not cookie:
+            raise HTTPException(status_code=400, detail="请先在站点设置中填写 HDHIVE_COOKIE 并保存。")
+        if not re.search(r"(?i)\btoken=", cookie):
+            raise HTTPException(
+                status_code=400,
+                detail="HDHIVE_COOKIE 中需包含 token=…（请从浏览器复制完整 Cookie）。",
+            )
+        proxy, proxy_err = resolve_hdhive_proxy(values)
+        if proxy_err:
+            raise HTTPException(status_code=400, detail=translate_error(proxy_err))
+        refresh = await asyncio.to_thread(
+            partial(maybe_refresh_hdhive_cookie, resolved_config_path, log, force=True)
+        )
+        if refresh.written:
+            return ApiResponse(
+                ok=True,
+                message="Cookie 已刷新（GET 首页响应中含新 token，已写回配置）。",
+                data={"updated": True, "via": "get_home_set_cookie"},
+            )
+        if refresh.kind == "network_error":
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"GET 首页失败（网络/TLS）：{refresh.message}"
+                    f"{_network_hint_for_message(refresh.message)}"
+                ),
+            )
+        if refresh.kind == "http_error":
+            raise HTTPException(status_code=502, detail=refresh.message or "GET 首页返回错误状态码。")
+        return ApiResponse(
+            ok=True,
+            message=(
+                "GET 首页未返回新的 token=（很常见：站点往往只在登录或签到响应里 Set-Cookie）。"
+                " 可改用 Cookie 模式「测试签到」/「立即签到」；若签到成功且响应带 Set-Cookie，系统会自动合并 token。"
+            ),
+            data={"updated": False, "via": "get_home_set_cookie", "kind": refresh.kind},
+        )
 
     @app.post("/api/hdhive/resolve-test")
     def hdhive_resolve_test(request: Request, payload: HdhiveResolveTestPayload) -> ApiResponse:

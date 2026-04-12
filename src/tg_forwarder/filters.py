@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from telethon.tl.custom.message import Message
 
 from tg_forwarder.config import CONTENT_MATCH_MODE_ANY, FilterConfig
+from tg_forwarder.env_utils import read_env_file
 from tg_forwarder.hdhive_resource_resolve import (
     collect_hdhive_resource_urls_from_message,
     extract_hdhive_resource_slug,
@@ -60,8 +63,16 @@ async def message_matches(
     filters: FilterConfig,
     *,
     env_values: dict[str, str] | None = None,
+    env_config_path: str | Path | None = None,
 ) -> bool:
-    return (await explain_message_match(message, filters, env_values=env_values)).matched
+    return (
+        await explain_message_match(
+            message,
+            filters,
+            env_values=env_values,
+            env_config_path=env_config_path,
+        )
+    ).matched
 
 
 def filter_requires_keyword_layer(filters: FilterConfig) -> bool:
@@ -107,6 +118,7 @@ async def explain_message_match(
     filters: FilterConfig,
     *,
     env_values: dict[str, str] | None = None,
+    env_config_path: str | Path | None = None,
 ) -> MessageMatchResult:
     if getattr(message, "action", None) is not None:
         return MessageMatchResult(matched=False)
@@ -181,9 +193,15 @@ async def explain_message_match(
         """
         if not bool(getattr(filters, "hdhive_resource_resolve_forward", False)):
             return None
-        import os
 
         values = env_values if env_values is not None else dict(os.environ)
+        if env_config_path is not None:
+            cfg = Path(env_config_path)
+            if cfg.is_file():
+                try:
+                    values = read_env_file(cfg)
+                except OSError:
+                    pass
         cookie = (values.get("HDHIVE_COOKIE") or "").strip()
         api_key = (values.get("HDHIVE_API_KEY") or "").strip()
         unlock_enabled = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_ENABLED")
@@ -298,27 +316,39 @@ async def explain_message_match(
         if any_unlock_skipped_over_points:
             return "HDHive 积分解锁已跳过（超过设定上限）"
         if any_unlock_skipped_unknown_points:
-            return "HDHive 积分解锁已跳过（无法从页面解析所需积分）"
+            return (
+                "HDHive 积分解锁已跳过（无法解析积分，多为 Cookie 失效；请在站点设置更新并保存 HDHIVE_COOKIE，"
+                "转发 Worker 每次解析前会重读 .env）"
+            )
         if any_unlock_error:
             return "HDHive 积分解锁失败"
         return "链接失效"
 
-    # Dedicated HDHive mode:
-    # - default: /resource/ links can trigger forwarding without keyword match
-    # - optional: require normal rule match (keywords/regex) before triggering
+    # HDHive /resource 直链模式（hdhive_resource_resolve_forward）：
+    # - 未勾选「仅命中规则时才转发 HDHive」：出现 resource 链接即尝试转发（仍先经过黑名单等）。
+    # - 勾选「仅命中规则」：须与下方「命中任一关键词 / 必须全部命中 / 正则」等主规则一起判定；
+    #   若已勾选但未配置任一关键词或正则，则含 HDHive 链接的消息不匹配（避免误走「无正向条件则全放行」）。
     if bool(getattr(filters, "hdhive_resource_resolve_forward", False)):
         urls = collect_hdhive_resource_urls_from_message(message, max_urls=3)
         require_rule_match = bool(getattr(filters, "hdhive_require_rule_match", False))
-        if urls and not require_rule_match:
-            result = MessageMatchResult(
-                matched=True,
-                matched_via=MATCH_VIA_MESSAGE,
-                has_media=has_media,
-                has_text=has_text,
-                missing_content_parts=missing_content_parts,
-            )
-            result.dispatch_text_override = _maybe_resolve_hdhive_override()
-            return result
+        if urls:
+            if not require_rule_match:
+                result = MessageMatchResult(
+                    matched=True,
+                    matched_via=MATCH_VIA_MESSAGE,
+                    has_media=has_media,
+                    has_text=has_text,
+                    missing_content_parts=missing_content_parts,
+                )
+                result.dispatch_text_override = _maybe_resolve_hdhive_override()
+                return result
+            if not has_positive_primary_filters(filters):
+                return MessageMatchResult(
+                    matched=False,
+                    has_media=has_media,
+                    has_text=has_text,
+                    missing_content_parts=missing_content_parts,
+                )
 
     has_pos = has_positive_primary_filters(filters)
     if not has_pos:

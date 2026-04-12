@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import sqlite3
-from contextlib import suppress
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event as ProcessEvent
 from pathlib import Path
@@ -28,6 +27,7 @@ from tg_forwarder.dashboard_actions import (
     resolve_targets,
     safe_get_entity,
 )
+from tg_forwarder.telegram_clients import disconnect_telegram_client
 from tg_forwarder.dispatch_queue import (
     DELIVERY_CHANNEL_ACCOUNT,
     DELIVERY_CHANNEL_BOT,
@@ -671,8 +671,11 @@ class PersistentQueueDispatcher:
         context = self._runtime_contexts.pop(runtime_key, None)
         if context is None:
             return
-        with suppress(Exception):
-            await context.user_client.disconnect()
+        await disconnect_telegram_client(
+            context.user_client,
+            logger=self.logger,
+            scope=f"dispatcher user client ({runtime_key})",
+        )
         await close_bot_forward_contexts(context.bot_contexts)
 
     async def _close_runtime_contexts(self) -> None:

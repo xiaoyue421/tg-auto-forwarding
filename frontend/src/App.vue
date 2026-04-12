@@ -519,28 +519,9 @@ export default dashboard;
                       placeholder="资源页直链、解析积分；Cookie 签到亦依赖此项"
                     ></textarea>
                   </label>
-                  <template v-if="config.hdhive_checkin_method === 'cookie'">
-                    <label class="span-2">
-                      <span>Next-Action</span>
-                      <input
-                        v-model="config.hdhive_next_action"
-                        type="text"
-                        autocomplete="off"
-                        spellcheck="false"
-                        placeholder="请求头 Next-Action 的值"
-                      />
-                    </label>
-                    <label class="span-2">
-                      <span>Next-Router-State-Tree</span>
-                      <textarea
-                        v-model="config.hdhive_next_router_state_tree"
-                        rows="2"
-                        autocomplete="off"
-                        spellcheck="false"
-                        placeholder="请求头 Next-Router-State-Tree 的值（可为 URL 编码字符串）"
-                      ></textarea>
-                    </label>
-                  </template>
+                  <p v-if="config.hdhive_checkin_method === 'cookie'" class="panel-subtext span-2">
+                    Cookie 模式签到使用程序内置的 Next-Action / Next-Router-State-Tree，只需维护有效 Cookie（token）。
+                  </p>
                   <div class="hdhive-secret-actions span-2">
                     <button type="button" class="btn btn-ghost btn-small" @click="hdhiveCredentialsOpen = false">
                       隐藏整块凭证区域
@@ -567,6 +548,39 @@ export default dashboard;
                 勾选后，HDHive 请求与 Telegram 共用上方「系统与连接」里的<strong>单代理</strong>（<code>TG_PROXY_*</code>）：支持
                 <code>http</code> / <code>https</code> / <code>socks5</code> / <code>socks4</code>，无需再单独改类型。
               </p>
+
+              <h3 class="span-2 sites-hdhive-unlock-title" style="margin-top: 0.5rem">Cookie 定时刷新（可选）</h3>
+              <p class="panel-subtext span-2">
+                <strong>转发 Worker</strong>在解析每条 HDHive 资源链接前会<strong>重新读取</strong>本配置文件中的
+                <code>HDHIVE_COOKIE</code>，因此你在上方保存的新 Cookie / 签到合并后的 token 会立即生效，无需重启服务。
+                定时 GET 仍依赖 <code>HDHIVE_COOKIE_REFRESH_ENABLED</code>；多数站点 GET 首页不会轮换 JWT，真正换 token 常在<strong>签到响应</strong>的
+                <code>Set-Cookie</code>（Cookie 模式测试/立即签到成功时会自动合并写回）。
+              </p>
+              <label class="toggle span-2">
+                <input type="checkbox" v-model="config.hdhive_cookie_refresh_enabled" />
+                <span>开启定时 GET hdhive.com 首页并尝试合并 <code>Set-Cookie</code> 中的 <code>token=</code>（需已保存含 token 的 Cookie）</span>
+              </label>
+              <label class="span-2">
+                <span>刷新间隔（秒，60–86400）</span>
+                <input
+                  v-model.number="config.hdhive_cookie_refresh_interval_sec"
+                  type="number"
+                  min="60"
+                  max="86400"
+                  step="60"
+                  inputmode="numeric"
+                />
+              </label>
+              <div class="toolbar sites-checkin-toolbar span-2">
+                <button
+                  type="button"
+                  class="btn btn-ghost btn-small"
+                  :disabled="hdhiveRefreshCookieBusy"
+                  @click="triggerHdhiveRefreshCookie"
+                >
+                  {{ hdhiveRefreshCookieBusy ? '刷新中...' : '立即 GET 首页尝试刷新 token' }}
+                </button>
+              </div>
 
               <div class="span-2 sites-hdhive-unlock-block">
                 <h3 class="sites-hdhive-unlock-title">转发：HDHive 积分解锁</h3>
@@ -882,9 +896,18 @@ export default dashboard;
                       <input type="checkbox" v-model="rule.hdhive_resource_resolve_forward" />
                       <span>HDHive：识别 resource 链接并转发直链（redirect_url）</span>
                     </label>
+                    <label class="toggle span-2">
+                      <input
+                        type="checkbox"
+                        v-model="rule.hdhive_require_rule_match"
+                        :disabled="!rule.hdhive_resource_resolve_forward"
+                      />
+                      <span>仅当命中下方关键词/正则时才转发 HDHive（需填写「命中任一」或「必须全部」或正则）</span>
+                    </label>
                     <p class="panel-subtext span-2">
-                      勾选后：当消息里出现 <code>hdhive.com/resource/…</code> 时，会用已保存的 <code>HDHIVE_COOKIE</code>（可选代理）
-                      请求页面，从 <code>NEXT_REDIRECT</code> 解析 <code>redirect_url</code> 并用该直链发送到队列目标。
+                      未勾选上一项时：只要消息里出现 <code>hdhive.com/resource/…</code> 即尝试直链转发（仍受黑名单等约束）。
+                      勾选后：须同时满足本规则中的关键词或正则（与「命中任一关键词才转发」等配置一致）；请至少填写一类正向条件。
+                      站点 <code>HDHIVE_COOKIE</code> 等在「站点设置」中配置。
                     </p>
                     <label class="toggle">
                       <input type="checkbox" v-model="rule.media_only" />

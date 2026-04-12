@@ -49,8 +49,6 @@ function createConfig() {
     hdhive_checkin_method: "api_key",
     hdhive_api_key: "",
     hdhive_cookie: "",
-    hdhive_next_action: "",
-    hdhive_next_router_state_tree: "",
     hdhive_checkin_enabled: false,
     hdhive_checkin_gambler: false,
     hdhive_checkin_use_proxy: false,
@@ -58,6 +56,8 @@ function createConfig() {
     hdhive_resource_unlock_max_points: 0,
     hdhive_resource_unlock_threshold_inclusive: true,
     hdhive_resource_unlock_skip_unknown_points: false,
+    hdhive_cookie_refresh_enabled: false,
+    hdhive_cookie_refresh_interval_sec: 1800,
     rules: [createRule()],
   };
 }
@@ -256,6 +256,7 @@ createApp({
         showBackToTop: false,
         showLogBottom: false,
       },
+      hdhiveRefreshCookieBusy: false,
       hdhiveResolveBusy: false,
       hdhiveResolveTestUrl: "",
       hdhiveResolveResult: "",
@@ -1146,6 +1147,22 @@ createApp({
         }
       }
     },
+    async triggerHdhiveRefreshCookie() {
+      this.hdhiveRefreshCookieBusy = true;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/hdhive/refresh-cookie", { method: "POST" });
+        this.notice = String(response.message || "已完成请求。");
+        if (response.data && response.data.updated) {
+          await this.fetchConfig();
+        }
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.hdhiveRefreshCookieBusy = false;
+      }
+    },
     async triggerHdhiveResolveTest() {
       this.hdhiveResolveBusy = true;
       this.hdhiveResolveResult = "";
@@ -1186,6 +1203,10 @@ createApp({
         this.config.hdhive_resource_unlock_max_points = Math.max(
           0,
           Math.floor(Number(this.config.hdhive_resource_unlock_max_points) || 0),
+        );
+        this.config.hdhive_cookie_refresh_interval_sec = Math.max(
+          60,
+          Math.min(86400, Math.floor(Number(this.config.hdhive_cookie_refresh_interval_sec) || 1800)),
         );
         const payload = {
           ...this.config,
@@ -1859,28 +1880,9 @@ createApp({
                           placeholder="完整 Cookie；资源页直链、unlock_points；Cookie 签到亦依赖此项"
                         ></textarea>
                       </label>
-                      <template v-if="config.hdhive_checkin_method === 'cookie'">
-                        <label class="span-2">
-                          <span>Next-Action</span>
-                          <input
-                            v-model="config.hdhive_next_action"
-                            type="text"
-                            autocomplete="off"
-                            spellcheck="false"
-                            placeholder="浏览器请求头 Next-Action 的值（站点更新后可能需重填）"
-                          />
-                        </label>
-                        <label class="span-2">
-                          <span>Next-Router-State-Tree</span>
-                          <textarea
-                            v-model="config.hdhive_next_router_state_tree"
-                            rows="2"
-                            autocomplete="off"
-                            spellcheck="false"
-                            placeholder="请求头 Next-Router-State-Tree（可为 URL 编码长串）"
-                          ></textarea>
-                        </label>
-                      </template>
+                      <p v-if="config.hdhive_checkin_method === 'cookie'" class="panel-subtext span-2">
+                        Cookie 模式签到使用程序内置的 Next-Action / Next-Router-State-Tree，只需维护 Cookie。
+                      </p>
                       <div class="inline-actions span-2">
                         <button type="button" class="inline-toggle" @click="ui.hdhiveCredentialsOpen = false">隐藏整块凭证区域</button>
                       </div>
@@ -1906,6 +1908,40 @@ createApp({
                       <input type="checkbox" v-model="config.hdhive_checkin_use_proxy" />
                       <span>访问 HDHive 走代理（使用下方「代理设置」里同一套单代理 TG_PROXY_*）</span>
                     </label>
+                  </div>
+                </section>
+
+                <section class="hdhive-stack-section" aria-labelledby="hdhive-cookie-refresh-heading">
+                  <h4 id="hdhive-cookie-refresh-heading" class="hdhive-section-title">3b. Cookie 定时刷新</h4>
+                  <div class="form-grid">
+                    <p class="panel-subtext span-2">
+                      转发 Worker 在解析 HDHive 链接前会重读本 .env 中的 <code>HDHIVE_COOKIE</code>，保存后即生效。
+                      GET 首页常不换 JWT；签到响应的 Set-Cookie 更可靠。下方开关写入 <code>HDHIVE_COOKIE_REFRESH_ENABLED</code>。
+                    </p>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="config.hdhive_cookie_refresh_enabled" />
+                      <span>开启定时 GET 首页并尝试合并 Set-Cookie 中的 token=</span>
+                    </label>
+                    <label class="span-2">
+                      <span>间隔（秒，60–86400）</span>
+                      <input
+                        v-model.number="config.hdhive_cookie_refresh_interval_sec"
+                        type="number"
+                        min="60"
+                        max="86400"
+                        step="60"
+                      />
+                    </label>
+                    <div class="span-2">
+                      <button
+                        type="button"
+                        class="btn btn-ghost btn-small"
+                        :disabled="hdhiveRefreshCookieBusy"
+                        @click="triggerHdhiveRefreshCookie"
+                      >
+                        {{ hdhiveRefreshCookieBusy ? '刷新中...' : '立即 GET 首页尝试刷新 token' }}
+                      </button>
+                    </div>
                   </div>
                 </section>
 
@@ -2203,12 +2239,12 @@ createApp({
                       </label>
                     </div>
                     <label class="toggle span-2">
-                      <input type="checkbox" v-model="rule.hdhive_require_rule_match" :disabled="!rule.hdhive_resource_resolve_forward" />
-                      <span>仅命中规则时才转发 HDHive（勾选后按关键词/正则命中执行）</span>
+                      <input type="checkbox" v-model="rule.hdhive_resource_resolve_forward" />
+                      <span>HDHive：识别 resource 链接并转发直链（默认出现链接即触发，仍受黑名单约束）</span>
                     </label>
                     <label class="toggle span-2">
-                      <input type="checkbox" v-model="rule.hdhive_resource_resolve_forward" />
-                      <span>HDHive 专用直链转发（命中 hdhive.com/resource 即触发，不依赖关键词）</span>
+                      <input type="checkbox" v-model="rule.hdhive_require_rule_match" :disabled="!rule.hdhive_resource_resolve_forward" />
+                      <span>仅当命中下方关键词/正则时才转发 HDHive（须至少填写「命中任一」或「必须全部」或正则之一）</span>
                     </label>
                     <label class="span-2">
                       <span>自定义正则：命中任一才转发</span>

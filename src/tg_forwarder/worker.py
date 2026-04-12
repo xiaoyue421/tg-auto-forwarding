@@ -39,7 +39,11 @@ from tg_forwarder.log_buffer import install_queue_forwarding_handler
 from tg_forwarder.logging_utils import configure_logging
 from tg_forwarder.modules.loader import MessageHookSet, load_message_hooks
 from tg_forwarder.monitoring import ForwardLogContext, build_targets_note, monitor_log
-from tg_forwarder.telegram_clients import build_telegram_client, connect_client_with_proxy_pool
+from tg_forwarder.telegram_clients import (
+    build_telegram_client,
+    connect_client_with_proxy_pool,
+    disconnect_telegram_client,
+)
 
 CATCH_UP_INTERVAL_SECONDS = 2.0
 CATCH_UP_BATCH_SIZE = 100
@@ -68,10 +72,10 @@ class ChannelWorker:
         self.stop_event = stop_event
         self.queue_db_path = queue_db_path
         self.logger = logging.getLogger(f"tg_forwarder.worker.{runtime.name}")
-        env_cfg = Path(config_path).resolve() if config_path else None
+        self._env_config_path: Path | None = Path(config_path).resolve() if config_path else None
         self._env_values: dict[str, str] = {}
-        if env_cfg is not None and env_cfg.is_file():
-            self._env_values = read_env_file(env_cfg)
+        if self._env_config_path is not None and self._env_config_path.is_file():
+            self._env_values = read_env_file(self._env_config_path)
         self._message_hooks: MessageHookSet = (
             load_message_hooks(env_cfg)
             if env_cfg is not None and env_cfg.is_file()
@@ -143,8 +147,11 @@ class ChannelWorker:
                     await catch_up_task
                 await self._drain_tasks()
         finally:
-            with suppress(Exception):
-                await client.disconnect()
+            await disconnect_telegram_client(
+                client,
+                logger=self.logger,
+                scope=f"worker `{self.runtime.name}`",
+            )
 
     def _build_event_handler(self, *, source_key: str, is_edit: bool):
         async def handle_event(event: object) -> None:
@@ -335,6 +342,7 @@ class ChannelWorker:
             message,
             self.runtime.filters,
             env_values=self._env_values or None,
+            env_config_path=self._env_config_path,
         )
         match_result = await self._apply_module_after_match_hooks(message, source_key, match_result)
         if not match_result.matched:
@@ -589,7 +597,11 @@ class ChannelWorker:
         while not self.stop_event.is_set():
             await asyncio.sleep(1)
         self.logger.info("stop signal received, disconnecting worker")
-        await client.disconnect()
+        await disconnect_telegram_client(
+            client,
+            logger=self.logger,
+            scope=f"worker `{self.runtime.name}` (stop signal)",
+        )
 
 
 def run_worker_process(
