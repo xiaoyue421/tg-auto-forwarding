@@ -473,7 +473,8 @@ export default dashboard;
               <div>
                 <h2>HDHive（hdhive.com）</h2>
                 <p class="panel-subtext hdhive-panel-intro">
-                  自上而下：签到方式 → 敏感凭证（默认折叠；含 Key、Cookie，Cookie 模式含 Next 头）→ 自动签到与转发策略。Key / Cookie 用途不变。修改后请点「保存配置」。
+                  自上而下：签到方式 → 敏感凭证 → 自动签到与转发策略。非 Premium 签到使用网页用户名与密码（内置调用
+                  hdhive_site_login_checkin）；Cookie 仍可用于资源直链解析，签到成功后会自动写回。修改后请点「保存配置」。
                 </p>
               </div>
             </div>
@@ -482,7 +483,7 @@ export default dashboard;
                 <span>签到方式（仅影响自动签到 / 测试签到所用通道）</span>
                 <select v-model="config.hdhive_checkin_method">
                   <option value="api_key">Premium — API Key（/api/open/checkin）</option>
-                  <option value="cookie">非 Premium — Cookie + Next 头（POST 首页）</option>
+                  <option value="cookie">非 Premium — 网页账号登录并签到（hdhive_site_login_checkin）</option>
                 </select>
               </label>
 
@@ -506,22 +507,50 @@ export default dashboard;
                       type="text"
                       autocomplete="off"
                       spellcheck="false"
-                      placeholder="签到（Premium）、OpenAPI 解锁等"
+                      placeholder="签到（Premium）、自动解锁等"
                     />
                   </label>
+                  <template v-if="config.hdhive_checkin_method === 'cookie'">
+                    <label class="span-2">
+                      <span>网页登录用户名（与 hdhive.com 登录页「用户名」一致，可为邮箱）</span>
+                      <input
+                        v-model="config.hdhive_login_username"
+                        type="text"
+                        autocomplete="username"
+                        spellcheck="false"
+                      />
+                    </label>
+                    <label class="span-2">
+                      <span>网页登录密码</span>
+                      <input
+                        v-model="config.hdhive_login_password"
+                        type="password"
+                        autocomplete="current-password"
+                        spellcheck="false"
+                      />
+                    </label>
+                    <p class="panel-subtext span-2">
+                      签到由服务端加载 <code>hdhive/hdhive_site_login_checkin.py</code> 完成登录与首页签到；可选在 .env 填写
+                      <code>HDHIVE_CHECKIN_NEXT_ACTION</code> 等覆盖内置解析。自动签到与测试/立即签到均只走账号密码登录（hdhive_site_login_checkin）。
+                    </p>
+                  </template>
                   <label class="span-2">
-                    <span>Cookie（完整一行，如 token=…）</span>
+                    <span v-if="config.hdhive_checkin_method === 'cookie'">
+                      Cookie（可选，用于资源页解析；网页账号签到成功后会自动写回）
+                    </span>
+                    <span v-else>Cookie（可选，仅用于资源页解析，与 OpenAPI 签到无关）</span>
                     <textarea
                       v-model="config.hdhive_cookie"
                       rows="3"
                       autocomplete="off"
                       spellcheck="false"
-                      placeholder="资源页直链、解析积分；Cookie 签到亦依赖此项"
+                      :placeholder="
+                        config.hdhive_checkin_method === 'cookie'
+                          ? '含 token=、refresh_token=…（可留空；网页账号签到成功后会写入）'
+                          : '含 token=、refresh_token=…（可留空；须自行维护或从浏览器复制）'
+                      "
                     ></textarea>
                   </label>
-                  <p v-if="config.hdhive_checkin_method === 'cookie'" class="panel-subtext span-2">
-                    Cookie 模式签到使用程序内置的 Next-Action / Next-Router-State-Tree，只需维护有效 Cookie（token）。
-                  </p>
                   <div class="hdhive-secret-actions span-2">
                     <button type="button" class="btn btn-ghost btn-small" @click="hdhiveCredentialsOpen = false">
                       隐藏整块凭证区域
@@ -530,7 +559,7 @@ export default dashboard;
                 </template>
               </div>
               <p v-if="config.hdhive_checkin_method !== 'cookie'" class="panel-subtext span-2">
-                当前为 API Key 签到：仍可在上方「敏感凭证」中填写 Cookie，用于资源页解析。
+                当前为 API Key 签到：可在上方填写 Cookie，用于资源页解析。
               </p>
               <label class="toggle span-2">
                 <input type="checkbox" v-model="config.hdhive_checkin_enabled" />
@@ -542,56 +571,33 @@ export default dashboard;
               </label>
               <label class="toggle span-2">
                 <input type="checkbox" v-model="config.hdhive_checkin_use_proxy" />
-                <span>通过代理访问 HDHive（使用「系统与连接」里已保存的代理类型、地址与端口；与 Telegram 共用同一套单代理配置）</span>
+                <span>HDHive 签到与 Telegram 共用「系统与连接」代理（<code>TG_PROXY_*</code>）；取消勾选则 HDHive 直连（仍可用下方专用 URL 覆盖）</span>
               </label>
               <p class="panel-subtext span-2">
-                勾选后，HDHive 请求与 Telegram 共用上方「系统与连接」里的<strong>单代理</strong>（<code>TG_PROXY_*</code>）：支持
-                <code>http</code> / <code>https</code> / <code>socks5</code> / <code>socks4</code>，无需再单独改类型。
+                默认勾选：未填专用 <code>HDHIVE_CHECKIN_PROXY_URL</code> 时，网页签到脚本与 OpenAPI 签到均走与 Telegram 相同的单代理（支持
+                <code>http</code> / <code>https</code> / <code>socks5</code> / <code>socks4</code>）。
               </p>
-
-              <h3 class="span-2 sites-hdhive-unlock-title" style="margin-top: 0.5rem">Cookie 定时刷新（可选）</h3>
-              <p class="panel-subtext span-2">
-                <strong>转发 Worker</strong>在解析每条 HDHive 资源链接前会<strong>重新读取</strong>本配置文件中的
-                <code>HDHIVE_COOKIE</code>，因此你在上方保存的新 Cookie / 签到合并后的 token 会立即生效，无需重启服务。
-                定时 GET 仍依赖 <code>HDHIVE_COOKIE_REFRESH_ENABLED</code>；多数站点 GET 首页不会轮换 JWT，真正换 token 常在<strong>签到响应</strong>的
-                <code>Set-Cookie</code>（Cookie 模式测试/立即签到成功时会自动合并写回）。
+              <p v-if="config.hdhive_checkin_method === 'cookie'" class="panel-subtext span-2">
+                <strong>转发 Worker</strong>解析资源时会使用配置中的 <code>HDHIVE_COOKIE</code>。网页账号模式下<strong>测试签到 / 立即签到 / 自动签到</strong>成功后会将登录会话 Cookie 写回该字段。
               </p>
-              <label class="toggle span-2">
-                <input type="checkbox" v-model="config.hdhive_cookie_refresh_enabled" />
-                <span>开启定时 GET hdhive.com 首页并尝试合并 <code>Set-Cookie</code> 中的 <code>token=</code>（需已保存含 token 的 Cookie）</span>
-              </label>
-              <label class="span-2">
-                <span>刷新间隔（秒，60–86400）</span>
-                <input
-                  v-model.number="config.hdhive_cookie_refresh_interval_sec"
-                  type="number"
-                  min="60"
-                  max="86400"
-                  step="60"
-                  inputmode="numeric"
-                />
-              </label>
-              <div class="toolbar sites-checkin-toolbar span-2">
-                <button
-                  type="button"
-                  class="btn btn-ghost btn-small"
-                  :disabled="hdhiveRefreshCookieBusy"
-                  @click="triggerHdhiveRefreshCookie"
-                >
-                  {{ hdhiveRefreshCookieBusy ? '刷新中...' : '立即 GET 首页尝试刷新 token' }}
-                </button>
-              </div>
+              <p v-else class="panel-subtext span-2">
+                <strong>转发 Worker</strong>若配置了 <code>HDHIVE_COOKIE</code> 会用于资源解析；<strong>Premium</strong> 签到走 OpenAPI，<strong>不会</strong>因签到自动改写该字段。
+              </p>
 
               <div class="span-2 sites-hdhive-unlock-block">
-                <h3 class="sites-hdhive-unlock-title">转发：HDHive 积分解锁</h3>
+                <h3 class="sites-hdhive-unlock-title">转发：HDHive 自动解锁</h3>
                 <p class="panel-subtext">
-                  与<strong>规则</strong>里「HDHive 专用直链转发」配合：<strong>优先</strong>用 Cookie 做免积分的 <code>/resource/</code> 直链解析；<strong>仅当失败</strong>且勾选下方开关时，再按积分上限用 OpenAPI 解锁（可能消耗积分）。上限与 MediaSync 的
-                  <code>subscription_hdhive_unlock_max_points_per_item</code> 一致：填 <strong>4</strong> 表示仅当页面解析到的所需积分 ≤ 4（含 4）时才自动解锁；<strong>0</strong> 表示不限制。
+                  与<strong>规则</strong>里「HDHive 专用直链转发」配合：转发时将直接按 <code>auto_unlock.py</code> 规则走 API 自动解锁（先查 share，再按免费/积分阈值判断，可能消耗积分）。
+                  上限与 MediaSync 的 <code>subscription_hdhive_unlock_max_points_per_item</code> 一致：填 <strong>4</strong> 表示仅当所需积分 ≤ 4（含 4）时才自动解锁；<strong>0</strong> 表示不限制。
+                </p>
+                <p class="panel-subtext">
+                  自动解锁调用的是 OpenAPI「分享详情 / 解锁」，与 HDHive <strong>签到</strong>（Premium：OpenAPI；非 Premium：<code>hdhive_site_login_checkin</code>）不是同一接口。
+                  即使签到测试未通过，只要本页配置的 API Key 对分享/解锁接口有效，转发仍可尝试获取直链。
                 </p>
               </div>
               <label class="toggle span-2">
                 <input type="checkbox" v-model="config.hdhive_resource_unlock_enabled" />
-                <span>启用积分解锁回退（解析失败时调用 OpenAPI，需配置 API Key）</span>
+                <span>启用自动解锁回退（解析失败时按自动解锁规则尝试解锁，需配置 API Key）</span>
               </label>
               <label class="span-2">
                 <span>自动解锁积分上限（单条，0 = 不限制）</span>
@@ -613,10 +619,10 @@ export default dashboard;
               </label>
             </div>
             <div class="sites-checkin-hint panel-subtext">
-                <strong>测试签到</strong>：用当前表单中的 Key 或 Cookie/Next 头与「博弈模式」发请求，<strong>不必先保存</strong>；是否走代理以已保存的
-                <strong>通过代理访问 HDHive</strong> 为准（勾选后请先保存配置）。成功或业务失败时提示优先显示接口返回的
-                <strong>message</strong> 与 <strong>description</strong>。
-                <strong>立即签到</strong>与<strong>自动签到</strong>均读 .env 已保存项。签到结果会写入<strong>日志</strong>页（不含 Cookie / Key 原文）。
+                <strong>测试签到</strong> / <strong>立即签到</strong>：点击后会<strong>先将当前表单写入 .env</strong>（含代理开关与 Telegram 代理字段），再调用服务端签到；与命令行跑
+                <code>hdhive_site_login_checkin.py</code> 时使用同一套代理解析逻辑。<strong>Premium</strong> 用表单 API Key；
+                <strong>非 Premium</strong> 用表单网页用户名与密码走 <code>hdhive_site_login_checkin</code>。提示优先显示返回的
+                <strong>message</strong> / <strong>description</strong>。<strong>自动签到</strong>仍由后台按已保存配置轮询；结果写入<strong>日志</strong>页。
             </div>
 
             <div class="toolbar sites-checkin-toolbar sites-checkin-actions">
@@ -637,8 +643,11 @@ export default dashboard;
             </div>
 
             <p class="panel-subtext span-2 sites-hdhive-preview-hint">
-              <strong>转发路径检测</strong>按<strong>已保存的 .env</strong>（Cookie、API Key、积分开关与上限）模拟转发器逻辑；<strong>不会</strong>调用
-              OpenAPI 解锁，不消耗积分。若刚改开关请先「保存配置」再测。
+              <strong>转发路径检测</strong>按<strong>已保存的 .env</strong>（API Key、<code>HDHIVE_BASE_URL</code>、<code>HDHIVE_ACCESS_TOKEN</code>、积分开关与上限）只读分享详情，模拟是否与真实转发一致；<strong>不会</strong>调用解锁接口，不消耗积分。若刚改开关请先「保存配置」再测。
+              本检测与<strong>测试签到</strong>无关：签到未通过时，此处仍可能显示「将自动解锁」。
+            </p>
+            <p class="panel-subtext span-2 sites-hdhive-preview-hint">
+              <strong>真实解锁测试</strong>与规则里「HDHive 专用直链转发」走同一套解锁逻辑（系统代理、积分上限等与 Worker 一致），会<strong>真实调用解锁接口</strong>，可能扣积分；用于确认最终直链效果。
             </p>
             <div class="sites-checkin-resolve span-2">
               <input
@@ -649,10 +658,18 @@ export default dashboard;
               <div class="sites-checkin-resolve-actions">
                 <button
                   class="btn btn-secondary btn-small"
-                  :disabled="hdhiveResolveBusy"
+                  :disabled="hdhiveResolveBusy || hdhiveResolveUnlockBusy"
                   @click="triggerHdhiveResolveTest"
                 >
                   {{ hdhiveResolveBusy ? '检测中...' : '检测转发路径' }}
+                </button>
+                <button
+                  type="button"
+                  class="btn btn-primary btn-small"
+                  :disabled="hdhiveResolveBusy || hdhiveResolveUnlockBusy"
+                  @click="triggerHdhiveResolveUnlockTest"
+                >
+                  {{ hdhiveResolveUnlockBusy ? '解锁中...' : '真实解锁测试（消耗积分）' }}
                 </button>
               </div>
             </div>
@@ -666,8 +683,8 @@ export default dashboard;
                 </span>
                 <p class="sites-hdhive-preview-summary">{{ hdhiveResolvePreview.summary }}</p>
               </div>
-              <p v-if="hdhiveResolvePreview.openapi_preview?.note" class="sites-hdhive-preview-note panel-subtext">
-                {{ hdhiveResolvePreview.openapi_preview.note }}
+              <p v-if="(hdhiveResolvePreview.auto_unlock_preview || hdhiveResolvePreview.openapi_preview)?.note" class="sites-hdhive-preview-note panel-subtext">
+                {{ (hdhiveResolvePreview.auto_unlock_preview || hdhiveResolvePreview.openapi_preview).note }}
               </p>
               <ul
                 v-if="hdhiveResolvePreview.detail_lines && hdhiveResolvePreview.detail_lines.length"
@@ -679,15 +696,49 @@ export default dashboard;
                 v-if="hdhiveResolveResult"
                 class="sites-hdhive-preview-redirect panel-subtext"
               >
-                <strong>解析到的直链（Cookie NEXT_REDIRECT）：</strong>
+                <strong>解析到的可转发链接（API 结果）：</strong>
                 <code>{{ hdhiveResolveResult }}</code>
               </p>
               <p v-if="hdhiveResolvePreview.slug" class="panel-subtext sites-hdhive-preview-meta">
-                资源 slug（用于 OpenAPI）：<code>{{ hdhiveResolvePreview.slug }}</code>
+                资源 slug（用于自动解锁）：<code>{{ hdhiveResolvePreview.slug }}</code>
                 <template v-if="hdhiveResolvePreview.unlock_points != null">
                   · 页面解析 unlock_points：<strong>{{ hdhiveResolvePreview.unlock_points }}</strong>
                 </template>
                 <template v-else> · 页面未解析到 unlock_points</template>
+              </p>
+            </div>
+            <div v-if="hdhiveRealUnlockResult" class="sites-hdhive-preview sites-hdhive-real-unlock span-2">
+              <div class="sites-hdhive-preview-head">
+                <span
+                  class="sites-hdhive-outcome"
+                  :class="
+                    'sites-hdhive-outcome--' + (hdhiveRealUnlockResult.success ? 'auto_unlock' : 'fail')
+                  "
+                >
+                  {{ hdhiveRealUnlockResult.success ? '真实解锁成功' : '真实解锁未成功' }}
+                </span>
+                <p class="sites-hdhive-preview-summary panel-subtext">
+                  <template v-if="hdhiveRealUnlockResult.success">
+                    以下为与转发 Worker 相同的解锁结果直链，可复制验证。
+                  </template>
+                  <template v-else-if="hdhiveRealUnlockResult.skipped_reason">
+                    跳过原因：<code>{{ hdhiveRealUnlockResult.skipped_reason }}</code>
+                  </template>
+                  <template v-else-if="hdhiveRealUnlockResult.error_message">
+                    {{ hdhiveRealUnlockResult.error_message }}
+                  </template>
+                  <template v-else>请查看上方提示或日志。</template>
+                </p>
+              </div>
+              <p
+                v-if="hdhiveRealUnlockResult.success && hdhiveRealUnlockResult.share_link"
+                class="sites-hdhive-preview-redirect panel-subtext"
+              >
+                <strong>解锁直链：</strong>
+                <code>{{ hdhiveRealUnlockResult.share_link }}</code>
+              </p>
+              <p v-if="hdhiveRealUnlockResult.slug" class="panel-subtext sites-hdhive-preview-meta">
+                slug：<code>{{ hdhiveRealUnlockResult.slug }}</code>
               </p>
             </div>
           </article>
@@ -907,7 +958,7 @@ export default dashboard;
                     <p class="panel-subtext span-2">
                       未勾选上一项时：只要消息里出现 <code>hdhive.com/resource/…</code> 即尝试直链转发（仍受黑名单等约束）。
                       勾选后：须同时满足本规则中的关键词或正则（与「命中任一关键词才转发」等配置一致）；请至少填写一类正向条件。
-                      站点 <code>HDHIVE_COOKIE</code> 等在「站点设置」中配置。
+                      直链解锁使用「站点设置」中的 API Key 与 <code>HDHIVE_BASE_URL</code> 等（与<strong>测试签到</strong>是否成功无关）。
                     </p>
                     <label class="toggle">
                       <input type="checkbox" v-model="rule.media_only" />

@@ -1,4 +1,4 @@
-"""命令行：调用 HDHive OpenAPI ``POST /api/open/resources/unlock``（与常见 PHP curl 脚本一致）。
+"""命令行：按 hdhive/auto_unlock.py 规则自动解锁 HDHive 资源。
 
 使用 .env 中的 ``HDHIVE_API_KEY``、``HDHIVE_BASE_URL``（可选）、``TG_PROXY_*``（若已配置主机则走代理，SOCKS5 + RDNS 等价 PHP 的 SOCKS5_HOSTNAME）。
 
@@ -19,14 +19,12 @@ from tg_forwarder.env_utils import read_env_file
 from tg_forwarder.hdhive_resource_resolve import (
     effective_hdhive_openapi_base_url,
     extract_hdhive_resource_slug,
-    unlock_hdhive_resource_via_open_api_sync,
+    unlock_hdhive_resource_via_cs_rule_sync,
 )
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="HDHive OpenAPI 积分解锁（单次请求，会消耗积分）",
-    )
+    parser = argparse.ArgumentParser(description="HDHive 自动解锁（先查 share，再按规则解锁）")
     parser.add_argument(
         "url_or_slug",
         help="完整 https://hdhive.com/resource/115/… 链接，或仅 slug（32 位十六进制等）",
@@ -36,6 +34,17 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path(".env"),
         help="读取 HDHIVE_API_KEY / 代理 的 .env 路径（默认 ./.env）",
+    )
+    parser.add_argument(
+        "--access-token",
+        default="",
+        help="可选：用户 access token（未传时会尝试读取 .env 的 HDHIVE_ACCESS_TOKEN）",
+    )
+    parser.add_argument(
+        "--max-points",
+        type=int,
+        default=0,
+        help="付费解锁积分阈值（0 表示不限制）",
     )
     args = parser.parse_args(argv)
 
@@ -73,17 +82,28 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     openapi_base = effective_hdhive_openapi_base_url(values)
-    ok, share_link, err = unlock_hdhive_resource_via_open_api_sync(
+    access_token = str(args.access_token or values.get("HDHIVE_ACCESS_TOKEN") or "").strip()
+    paid_max_points = int(args.max_points) if int(args.max_points) > 0 else 2_147_483_647
+    result = unlock_hdhive_resource_via_cs_rule_sync(
         slug=slug,
         api_key=api_key,
+        access_token=access_token,
         proxy=unlock_proxy,
         timeout_seconds=30.0,
         openapi_base_url=openapi_base,
+        allow_paid=True,
+        max_points=paid_max_points,
     )
-    if ok and share_link.strip():
-        print(share_link.strip())
+    if result.success and result.share_link.strip():
+        print(result.share_link.strip())
         return 0
-    print(err or "解锁失败", file=sys.stderr)
+    if result.skipped_reason == "over_threshold":
+        print("解锁已跳过：超过 max-points 阈值", file=sys.stderr)
+        return 1
+    if result.skipped_reason:
+        print("解锁已跳过：资源不满足自动解锁规则", file=sys.stderr)
+        return 1
+    print(result.error_message or "解锁失败", file=sys.stderr)
     return 1
 
 

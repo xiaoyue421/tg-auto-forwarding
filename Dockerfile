@@ -30,6 +30,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
+# 非 Premium 网页签到依赖仓库根目录 hdhive/（与 PYTHONPATH=/workspace/src 下的 tg_forwarder 配套）
+COPY hdhive ./hdhive
 COPY --from=dashboard /build/src ./src
 COPY --from=dashboard /build/src/tg_forwarder/web/static /opt/tg-forwarder-dashboard-static
 COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

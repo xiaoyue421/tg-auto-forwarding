@@ -13,12 +13,8 @@ from tg_forwarder.env_utils import read_env_file
 from tg_forwarder.hdhive_resource_resolve import (
     collect_hdhive_resource_urls_from_message,
     extract_hdhive_resource_slug,
-    extract_unlock_points_from_hdhive_resource_html,
     effective_hdhive_openapi_base_url,
-    load_hdhive_resource_page_text_sync,
-    resolve_hdhive_resource_redirect_sync,
-    should_attempt_hdhive_openapi_unlock,
-    unlock_hdhive_resource_via_open_api_sync,
+    unlock_hdhive_resource_via_cs_rule_sync,
 )
 from tg_forwarder.message_index import extract_message_keyword_values, extract_message_text_values
 
@@ -179,15 +175,8 @@ async def explain_message_match(
     def _maybe_resolve_hdhive_override() -> str | None:
         """HDHive ``/resource/115/{slug}`` 等链接的转发正文替换逻辑（需规则开启「HDHive 专用直链转发」）。
 
-        流程与「先判免费 / 再解锁 / 再取直连」一致：
-
-        1. **判免费**：用 ``HDHIVE_COOKIE`` GET 资源页，解析 ``NEXT_REDIRECT`` → 得到 115cdn 等**直连**则
-           **立即返回**（不消耗积分，不调用 OpenAPI）。
-        2. **判积分解锁**：页内解析 ``unlock_points`` / ``points_required`` / 中文「需要使用 N 积分解锁」等；
-           与站点「自动解锁积分上限」比较；未开启解锁、超上限、未知积分且保守策略 → 跳过解锁分支。
-        3. **需解锁时**：``POST`` OpenAPI ``/api/open/resources/unlock``（body: ``{"slug":...}``，头 ``X-API-Key``）。
-           成功后 **再次** 用同一 Cookie GET 同一资源 URL，解析 **NEXT_REDIRECT 直连**；若仍无则回退
-           接口返回的分享链接。
+        当前为 API-only 流程：仅按 ``auto_unlock.py`` 规则执行自动解锁（先 share，再解锁）。
+        不再使用 Cookie 页面解析/NEXT_REDIRECT。
 
         失败时返回固定中文提示字符串（不回落为原始消息）。无 resource URL 时返回 ``None``。
         """
@@ -202,18 +191,16 @@ async def explain_message_match(
                     values = read_env_file(cfg)
                 except OSError:
                     pass
-        cookie = (values.get("HDHIVE_COOKIE") or "").strip()
         api_key = (values.get("HDHIVE_API_KEY") or "").strip()
         unlock_enabled = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_ENABLED")
         unlock_max_points = _parse_hdhive_unlock_max_points(values)
-        unlock_inclusive = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_THRESHOLD_INCLUSIVE", default=True)
-        unlock_skip_unknown = _env_bool(values, "HDHIVE_RESOURCE_UNLOCK_SKIP_UNKNOWN_POINTS", default=False)
+        unlock_access_token = (values.get("HDHIVE_ACCESS_TOKEN") or "").strip()
         if unlock_enabled and not api_key:
             global _HDHIVE_UNLOCK_MISSING_KEY_WARNED
             if not _HDHIVE_UNLOCK_MISSING_KEY_WARNED:
                 logging.getLogger("tg_forwarder.hdhive").warning(
                     "已开启 HDHIVE_RESOURCE_UNLOCK_ENABLED，但未配置 HDHIVE_API_KEY；"
-                    "将跳过积分解锁，仅尝试 Cookie 解析直链。"
+                    "将跳过自动解锁。"
                 )
                 _HDHIVE_UNLOCK_MISSING_KEY_WARNED = True
         urls = collect_hdhive_resource_urls_from_message(message, max_urls=3)
@@ -226,9 +213,6 @@ async def explain_message_match(
         except Exception:
             system_proxy = None
         has_system_proxy = bool(system_proxy and str(system_proxy.host or "").strip())
-        # 资源页 GET：仅当勾选「通过代理访问 HDHive」时走代理
-        resolve_proxy = system_proxy if (_env_bool(values, "HDHIVE_CHECKIN_USE_PROXY") and has_system_proxy) else None
-        # OpenAPI 解锁：与常见 PHP 脚本一致，只要配置了 TG_PROXY_* 即走系统代理（不必同时勾选 HDHive 走代理）
         unlock_proxy = system_proxy if has_system_proxy else None
 
         any_permission_error = False
@@ -236,78 +220,48 @@ async def explain_message_match(
         any_unlock_error = False
         any_unlock_skipped_over_points = False
         any_unlock_skipped_unknown_points = False
+        any_unlock_skipped_disabled = False
         openapi_base = effective_hdhive_openapi_base_url(values)
         for url in urls:
-            page_text = ""
-            # --- ① 免费：Cookie 拉页 → 有 NEXT_REDIRECT 即直连转发 ---
-            if cookie:
-                ok, redirect_url, err, page_text = resolve_hdhive_resource_redirect_sync(
-                    url,
-                    cookie_header=cookie,
-                    proxy=resolve_proxy,
-                    timeout_seconds=30.0,
-                )
-                if ok and redirect_url.strip():
-                    return redirect_url.strip()
-                err_text = (err or "").strip()
-                if err_text.startswith("HTTP错误:"):
-                    code = err_text.replace("HTTP错误:", "").strip().split(" ", 1)[0]
-                    if code in {"401", "403"}:
-                        any_permission_error = True
-                if "未找到重定向URL" in err_text or "HTTP错误: 404" in err_text:
-                    any_invalid_error = True
-
-            # --- ② 非直连：解析所需积分，对照上限后决定是否 OpenAPI 解锁 ---
+            # --- API-only：按 hdhive/auto_unlock.py 规则（先 share 再自动解锁） ---
             if unlock_enabled and api_key:
                 slug = extract_hdhive_resource_slug(url)
                 if not slug:
                     continue
-                unlock_points = extract_unlock_points_from_hdhive_resource_html(page_text)
-                if unlock_points is None and not (page_text or "").strip():
-                    probe_text, _probe_err = load_hdhive_resource_page_text_sync(
-                        url,
-                        cookie_header=cookie,
-                        proxy=resolve_proxy,
-                        timeout_seconds=30.0,
-                    )
-                    unlock_points = extract_unlock_points_from_hdhive_resource_html(probe_text)
-                allow_unlock, skip_reason = should_attempt_hdhive_openapi_unlock(
-                    unlock_points,
-                    max_points_per_item=unlock_max_points,
-                    threshold_inclusive=unlock_inclusive,
-                    skip_when_points_unknown=unlock_skip_unknown,
-                )
-                if not allow_unlock:
-                    if skip_reason == "over_threshold":
-                        any_unlock_skipped_over_points = True
-                    elif skip_reason == "unknown_points":
-                        any_unlock_skipped_unknown_points = True
-                    continue
-                # --- ③ POST 解锁 slug；成功后再次 GET 取 NEXT_REDIRECT 直连（优先于接口里的分享 URL）---
-                unlock_ok, share_link, unlock_err = unlock_hdhive_resource_via_open_api_sync(
+                # 配置兼容：max_points=0 视作不限制（历史行为），因此给一个很大的阈值。
+                paid_max_points = unlock_max_points if unlock_max_points > 0 else 2_147_483_647
+                unlock_result = unlock_hdhive_resource_via_cs_rule_sync(
                     slug=slug,
                     api_key=api_key,
+                    access_token=unlock_access_token,
                     proxy=unlock_proxy,
                     timeout_seconds=30.0,
                     openapi_base_url=openapi_base,
+                    allow_paid=True,
+                    max_points=paid_max_points,
                 )
-                if unlock_ok and share_link.strip():
-                    if cookie:
-                        ok_after, redirect_after, _err_after, _pt_after = (
-                            resolve_hdhive_resource_redirect_sync(
-                                url,
-                                cookie_header=cookie,
-                                proxy=resolve_proxy,
-                                timeout_seconds=30.0,
-                            )
-                        )
-                        if ok_after and redirect_after.strip():
-                            return redirect_after.strip()
-                    return share_link.strip()
-                if unlock_err:
+                if unlock_result.success and unlock_result.share_link.strip():
+                    return unlock_result.share_link.strip()
+                if unlock_result.skipped_reason == "over_threshold":
+                    any_unlock_skipped_over_points = True
+                    continue
+                if unlock_result.skipped_reason == "unknown_or_not_free":
+                    any_unlock_skipped_unknown_points = True
+                    continue
+                if unlock_result.skipped_reason == "paid_unlock_disabled":
+                    any_unlock_skipped_disabled = True
+                    continue
+                if unlock_result.error_message:
+                    err_text = (unlock_result.error_message or "").strip()
+                    if err_text.startswith("HTTP错误:"):
+                        code = err_text.replace("HTTP错误:", "").strip().split(" ", 1)[0]
+                        if code in {"401", "403"}:
+                            any_permission_error = True
+                        if code in {"404"}:
+                            any_invalid_error = True
                     any_unlock_error = True
 
-        if not cookie and not (unlock_enabled and api_key):
+        if not (unlock_enabled and api_key):
             return "HDHive 链接无权获取"
         if any_permission_error:
             return "HDHive 链接无权获取"
@@ -316,10 +270,9 @@ async def explain_message_match(
         if any_unlock_skipped_over_points:
             return "HDHive 积分解锁已跳过（超过设定上限）"
         if any_unlock_skipped_unknown_points:
-            return (
-                "HDHive 积分解锁已跳过（无法解析积分，多为 Cookie 失效；请在站点设置更新并保存 HDHIVE_COOKIE，"
-                "转发 Worker 每次解析前会重读 .env）"
-            )
+            return "HDHive 积分解锁已跳过（当前资源不满足自动解锁规则）"
+        if any_unlock_skipped_disabled:
+            return "HDHive 积分解锁已跳过（当前资源不满足自动解锁规则）"
         if any_unlock_error:
             return "HDHive 积分解锁失败"
         return "链接失效"

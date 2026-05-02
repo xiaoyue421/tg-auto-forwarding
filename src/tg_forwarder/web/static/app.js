@@ -49,15 +49,15 @@ function createConfig() {
     hdhive_checkin_method: "api_key",
     hdhive_api_key: "",
     hdhive_cookie: "",
+    hdhive_login_username: "",
+    hdhive_login_password: "",
     hdhive_checkin_enabled: false,
     hdhive_checkin_gambler: false,
-    hdhive_checkin_use_proxy: false,
+    hdhive_checkin_use_proxy: true,
     hdhive_resource_unlock_enabled: false,
     hdhive_resource_unlock_max_points: 0,
     hdhive_resource_unlock_threshold_inclusive: true,
     hdhive_resource_unlock_skip_unknown_points: false,
-    hdhive_cookie_refresh_enabled: false,
-    hdhive_cookie_refresh_interval_sec: 1800,
     rules: [createRule()],
   };
 }
@@ -256,11 +256,12 @@ createApp({
         showBackToTop: false,
         showLogBottom: false,
       },
-      hdhiveRefreshCookieBusy: false,
       hdhiveResolveBusy: false,
+      hdhiveResolveUnlockBusy: false,
       hdhiveResolveTestUrl: "",
       hdhiveResolveResult: "",
       hdhiveResolvePreview: null,
+      hdhiveRealUnlockResult: null,
     };
   },
   computed: {
@@ -290,9 +291,10 @@ createApp({
     hdhiveOutcomeLabel() {
       const o = this.hdhiveResolvePreview?.outcome;
       const map = {
-        direct: "Cookie 直连（免积分）",
-        openapi: "将回退 OpenAPI 积分解锁",
-        fail: "直链不可用 / 不会自动解锁",
+        direct: "旧模式：Cookie 直连",
+        auto_unlock: "将回退自动解锁（自动解锁规则）",
+        openapi: "将回退自动解锁（自动解锁规则）",
+        fail: "不会自动解锁",
         invalid_url: "链接无效",
       };
       return map[o] || "检测结果";
@@ -405,7 +407,9 @@ createApp({
       return Boolean(this.healthCheckin?.enabled);
     },
     healthCheckinMethodLabel() {
-      return String(this.healthCheckin?.method || "") === "cookie" ? "Cookie 模式" : "API Key 模式";
+      return String(this.healthCheckin?.method || "") === "cookie"
+        ? "网页账号（站点登录）"
+        : "API Key 模式";
     },
     healthCheckinNextRetryText() {
       const epoch = Number(this.healthCheckin?.next_retry_epoch || 0);
@@ -983,11 +987,34 @@ createApp({
       };
       const response = await fetch(url, {
         ...options,
+        credentials: "include",
         headers: mergedHeaders,
       });
-      const payload = await response.json().catch(() => ({}));
+      const rawText = await response.text();
+      const trimmed = rawText.trim();
+      let payload = {};
+      if (trimmed) {
+        try {
+          payload = JSON.parse(rawText);
+        } catch (_e) {
+          if (!response.ok) {
+            const statusLine = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+            throw new Error(`${statusLine}：${trimmed.slice(0, 800)}`);
+          }
+          throw new Error(`响应不是合法 JSON（HTTP ${response.status}）`);
+        }
+      }
       if (!response.ok) {
-        throw new Error(this.formatApiError(payload));
+        const formatted = this.formatApiError(payload);
+        if (formatted && formatted !== "请求失败") {
+          throw new Error(formatted);
+        }
+        const statusLine = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+        throw new Error(
+          trimmed
+            ? `${statusLine}（响应不是标准 JSON，无法解析错误详情）`
+            : `${statusLine}（无响应正文；多为未连上后端、反代超时或服务未启动）`,
+        );
       }
       return payload;
     },
@@ -1147,26 +1174,11 @@ createApp({
         }
       }
     },
-    async triggerHdhiveRefreshCookie() {
-      this.hdhiveRefreshCookieBusy = true;
-      this.notice = "";
-      this.error = "";
-      try {
-        const response = await this.fetchJson("/api/hdhive/refresh-cookie", { method: "POST" });
-        this.notice = String(response.message || "已完成请求。");
-        if (response.data && response.data.updated) {
-          await this.fetchConfig();
-        }
-      } catch (err) {
-        this.error = this.normalizeCaughtError(err);
-      } finally {
-        this.hdhiveRefreshCookieBusy = false;
-      }
-    },
     async triggerHdhiveResolveTest() {
       this.hdhiveResolveBusy = true;
       this.hdhiveResolveResult = "";
       this.hdhiveResolvePreview = null;
+      this.hdhiveRealUnlockResult = null;
       this.notice = "";
       this.error = "";
       try {
@@ -1180,6 +1192,9 @@ createApp({
           body: JSON.stringify({ url }),
         });
         const preview = response.data?.preview ?? null;
+        if (preview && typeof preview === "object" && !preview.auto_unlock_preview && preview.openapi_preview) {
+          preview.auto_unlock_preview = preview.openapi_preview;
+        }
         this.hdhiveResolvePreview = preview && typeof preview === "object" ? preview : null;
         const got = String(response.data?.redirect_url ?? "").trim();
         this.hdhiveResolveResult = got;
@@ -1188,6 +1203,43 @@ createApp({
         this.error = this.normalizeCaughtError(err);
       } finally {
         this.hdhiveResolveBusy = false;
+      }
+    },
+    async triggerHdhiveResolveUnlockTest() {
+      const url = String(this.hdhiveResolveTestUrl ?? "").trim();
+      if (!url) {
+        this.error = "请先粘贴 hdhive.com/resource/... 链接。";
+        return;
+      }
+      if (
+        !window.confirm(
+          "将按与「HDHive 专用直链转发」相同的逻辑真实调用解锁接口，可能消耗积分。确定继续？",
+        )
+      ) {
+        return;
+      }
+      this.hdhiveResolveUnlockBusy = true;
+      this.hdhiveRealUnlockResult = null;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/hdhive/resolve-unlock-test", {
+          method: "POST",
+          body: JSON.stringify({ url }),
+        });
+        const d = response.data || {};
+        this.hdhiveRealUnlockResult = {
+          success: Boolean(d.success),
+          share_link: String(d.share_link || "").trim(),
+          skipped_reason: String(d.skipped_reason || "").trim(),
+          error_message: String(d.error_message || "").trim(),
+          slug: String(d.slug || "").trim(),
+        };
+        this.notice = String(response.message || "").trim() || (d.success ? "已获取直链。" : "解锁未完成。");
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.hdhiveResolveUnlockBusy = false;
       }
     },
     async saveConfig(options = {}) {
@@ -1203,10 +1255,6 @@ createApp({
         this.config.hdhive_resource_unlock_max_points = Math.max(
           0,
           Math.floor(Number(this.config.hdhive_resource_unlock_max_points) || 0),
-        );
-        this.config.hdhive_cookie_refresh_interval_sec = Math.max(
-          60,
-          Math.min(86400, Math.floor(Number(this.config.hdhive_cookie_refresh_interval_sec) || 1800)),
         );
         const payload = {
           ...this.config,
@@ -1826,7 +1874,7 @@ createApp({
                 <div>
                   <h3>HDHive（hdhive.com）一站配置</h3>
                   <p class="panel-subtext hdhive-panel-intro">
-                    自上而下：签到方式 → 敏感凭证（默认折叠；含 Key、Cookie，Cookie 签到时含 Next 头）→ 自动签到与转发策略。保存写入
+                    签到方式 → 敏感凭证 → 自动签到。非 Premium 使用网页用户名与密码签到（hdhive_site_login_checkin）；Cookie 可选用于资源解析，签到成功后会写回。保存写入
                     <code>.env</code>。
                   </p>
                 </div>
@@ -1839,11 +1887,11 @@ createApp({
                       <span>签到方式（仅影响自动签到 / 测试签到所用通道）</span>
                       <select v-model="config.hdhive_checkin_method">
                         <option value="api_key">Premium — API Key（/api/open/checkin）</option>
-                        <option value="cookie">非 Premium — Cookie + Next 请求头（与网页相同）</option>
+                        <option value="cookie">非 Premium — 网页账号登录并签到</option>
                       </select>
                     </label>
                     <p class="panel-subtext span-2">
-                      只决定每日签到走 OpenAPI 还是 Next Action；与下方凭证填写无强制对应关系。
+                      Premium 走 OpenAPI 签到；非 Premium 走网页账号密码登录（<code>hdhive_site_login_checkin</code>）与首页签到。下方 Cookie 主要用于资源页解析，与签到方式无强制一一对应。
                     </p>
                   </div>
                 </section>
@@ -1870,19 +1918,37 @@ createApp({
                           placeholder="用于签到、积分解锁等"
                         />
                       </label>
+                      <template v-if="config.hdhive_checkin_method === 'cookie'">
+                        <label class="span-2">
+                          <span>网页登录用户名（可为邮箱）</span>
+                          <input v-model="config.hdhive_login_username" type="text" autocomplete="username" spellcheck="false" />
+                        </label>
+                        <label class="span-2">
+                          <span>网页登录密码</span>
+                          <input v-model="config.hdhive_login_password" type="password" autocomplete="current-password" spellcheck="false" />
+                        </label>
+                        <p class="panel-subtext span-2">
+                          签到由服务端加载 <code>hdhive/hdhive_site_login_checkin.py</code>；可选在 .env 填写
+                          <code>HDHIVE_CHECKIN_NEXT_ACTION</code> 等覆盖内置解析。自动签到与测试/立即签到均只走账号密码登录。
+                        </p>
+                      </template>
                       <label class="span-2">
-                        <span>HDHive Cookie（可选）</span>
+                        <span v-if="config.hdhive_checkin_method === 'cookie'">
+                          Cookie（可选，资源解析；网页账号签到成功后可自动写回）
+                        </span>
+                        <span v-else>Cookie（可选，仅用于资源页解析，与 OpenAPI 签到无关）</span>
                         <textarea
                           v-model="config.hdhive_cookie"
                           rows="3"
                           autocomplete="off"
                           spellcheck="false"
-                          placeholder="完整 Cookie；资源页直链、unlock_points；Cookie 签到亦依赖此项"
+                          :placeholder="
+                            config.hdhive_checkin_method === 'cookie'
+                              ? '可留空；网页账号签到成功后会写入 token 等'
+                              : '可留空；须自行维护或从浏览器复制'
+                          "
                         ></textarea>
                       </label>
-                      <p v-if="config.hdhive_checkin_method === 'cookie'" class="panel-subtext span-2">
-                        Cookie 模式签到使用程序内置的 Next-Action / Next-Router-State-Tree，只需维护 Cookie。
-                      </p>
                       <div class="inline-actions span-2">
                         <button type="button" class="inline-toggle" @click="ui.hdhiveCredentialsOpen = false">隐藏整块凭证区域</button>
                       </div>
@@ -1908,49 +1974,21 @@ createApp({
                       <input type="checkbox" v-model="config.hdhive_checkin_use_proxy" />
                       <span>访问 HDHive 走代理（使用下方「代理设置」里同一套单代理 TG_PROXY_*）</span>
                     </label>
-                  </div>
-                </section>
-
-                <section class="hdhive-stack-section" aria-labelledby="hdhive-cookie-refresh-heading">
-                  <h4 id="hdhive-cookie-refresh-heading" class="hdhive-section-title">3b. Cookie 定时刷新</h4>
-                  <div class="form-grid">
-                    <p class="panel-subtext span-2">
-                      转发 Worker 在解析 HDHive 链接前会重读本 .env 中的 <code>HDHIVE_COOKIE</code>，保存后即生效。
-                      GET 首页常不换 JWT；签到响应的 Set-Cookie 更可靠。下方开关写入 <code>HDHIVE_COOKIE_REFRESH_ENABLED</code>。
+                    <p v-if="config.hdhive_checkin_method === 'cookie'" class="panel-subtext span-2">
+                      网页账号签到成功后会写回 <code>HDHIVE_COOKIE</code>，转发 Worker 解析资源时使用。
                     </p>
-                    <label class="toggle span-2">
-                      <input type="checkbox" v-model="config.hdhive_cookie_refresh_enabled" />
-                      <span>开启定时 GET 首页并尝试合并 Set-Cookie 中的 token=</span>
-                    </label>
-                    <label class="span-2">
-                      <span>间隔（秒，60–86400）</span>
-                      <input
-                        v-model.number="config.hdhive_cookie_refresh_interval_sec"
-                        type="number"
-                        min="60"
-                        max="86400"
-                        step="60"
-                      />
-                    </label>
-                    <div class="span-2">
-                      <button
-                        type="button"
-                        class="btn btn-ghost btn-small"
-                        :disabled="hdhiveRefreshCookieBusy"
-                        @click="triggerHdhiveRefreshCookie"
-                      >
-                        {{ hdhiveRefreshCookieBusy ? '刷新中...' : '立即 GET 首页尝试刷新 token' }}
-                      </button>
-                    </div>
+                    <p v-else class="panel-subtext span-2">
+                      转发 Worker 若配置了 <code>HDHIVE_COOKIE</code> 会用于资源解析；Premium 签到不会自动改写该字段。
+                    </p>
                   </div>
                 </section>
 
                 <section class="hdhive-stack-section" aria-labelledby="hdhive-unlock-heading">
-                  <h4 id="hdhive-unlock-heading" class="hdhive-section-title">4. 转发 — 积分解锁策略</h4>
+                  <h4 id="hdhive-unlock-heading" class="hdhive-section-title">4. 转发 — 自动解锁策略</h4>
                   <div class="form-grid">
                     <label class="toggle span-2">
                       <input type="checkbox" v-model="config.hdhive_resource_unlock_enabled" />
-                      <span>启用积分解锁回退（优先免积分 Cookie 直链；失败后再用 API Key 走 OpenAPI，可能消耗积分）</span>
+                      <span>启用自动解锁回退（仅走 API 自动解锁，可能消耗积分）</span>
                     </label>
                     <p class="panel-subtext span-2">
                       开启后须配置 API Key；否则日志会提示已开解锁但未配置 Key 并跳过。
@@ -1975,13 +2013,21 @@ createApp({
                       <input type="checkbox" v-model="config.hdhive_resource_unlock_skip_unknown_points" />
                       <span>无法从页面解析所需积分时跳过解锁（更保守）</span>
                     </label>
+                    <p class="panel-subtext span-2">
+                      自动解锁使用 OpenAPI「分享详情 / 解锁」，与 HDHive <strong>签到</strong>（Premium：OpenAPI；非 Premium：<code>hdhive_site_login_checkin</code>）不是同一接口。
+                      即使签到测试未通过，只要 API Key 对分享/解锁有效，转发仍可尝试获取直链。
+                    </p>
                   </div>
                 </section>
 
                 <section class="hdhive-stack-section" aria-labelledby="hdhive-forward-test-heading">
                   <h4 id="hdhive-forward-test-heading" class="hdhive-section-title">5. 转发路径检测（不耗积分）</h4>
                   <p class="panel-subtext span-2">
-                    按<strong>已保存的 .env</strong> 模拟转发逻辑；<strong>不会</strong>调用 OpenAPI 解锁。改开关后请先保存配置。
+                    按<strong>已保存的 .env</strong>（含 <code>HDHIVE_BASE_URL</code>、<code>HDHIVE_ACCESS_TOKEN</code>）只读分享详情模拟转发；<strong>不会</strong>调用解锁接口。改开关后请先保存配置。
+                    与<strong>测试签到</strong>无关：签到未通过时，此处仍可能显示将自动解锁。
+                  </p>
+                  <p class="panel-subtext span-2">
+                    <strong>真实解锁测试</strong>与规则「HDHive 专用直链转发」相同逻辑，会<strong>真实调用解锁</strong>，可能扣积分。
                   </p>
                   <div class="form-grid span-2">
                     <label class="span-2">
@@ -1998,10 +2044,18 @@ createApp({
                       <button
                         type="button"
                         class="btn btn-secondary btn-small"
-                        :disabled="hdhiveResolveBusy"
+                        :disabled="hdhiveResolveBusy || hdhiveResolveUnlockBusy"
                         @click="triggerHdhiveResolveTest"
                       >
                         {{ hdhiveResolveBusy ? '检测中...' : '检测转发路径' }}
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-primary btn-small"
+                        :disabled="hdhiveResolveBusy || hdhiveResolveUnlockBusy"
+                        @click="triggerHdhiveResolveUnlockTest"
+                      >
+                        {{ hdhiveResolveUnlockBusy ? '解锁中...' : '真实解锁测试（消耗积分）' }}
                       </button>
                     </div>
                     <div v-if="hdhiveResolvePreview" class="span-2 hdhive-resolve-preview-card">
@@ -2014,8 +2068,11 @@ createApp({
                         </span>
                         <p class="hdhive-resolve-summary">{{ hdhiveResolvePreview.summary }}</p>
                       </div>
-                      <p v-if="hdhiveResolvePreview.openapi_preview && hdhiveResolvePreview.openapi_preview.note" class="panel-subtext">
-                        {{ hdhiveResolvePreview.openapi_preview.note }}
+                      <p
+                        v-if="(hdhiveResolvePreview.auto_unlock_preview || hdhiveResolvePreview.openapi_preview) && (hdhiveResolvePreview.auto_unlock_preview || hdhiveResolvePreview.openapi_preview).note"
+                        class="panel-subtext"
+                      >
+                        {{ (hdhiveResolvePreview.auto_unlock_preview || hdhiveResolvePreview.openapi_preview).note }}
                       </p>
                       <ul v-if="hdhiveResolvePreview.detail_lines && hdhiveResolvePreview.detail_lines.length" class="hdhive-resolve-lines">
                         <li v-for="(line, idx) in hdhiveResolvePreview.detail_lines" :key="idx">{{ line }}</li>
@@ -2028,6 +2085,32 @@ createApp({
                         <template v-if="hdhiveResolvePreview.unlock_points != null">
                           · unlock_points <strong>{{ hdhiveResolvePreview.unlock_points }}</strong>
                         </template>
+                      </p>
+                    </div>
+                    <div v-if="hdhiveRealUnlockResult" class="span-2 hdhive-resolve-preview-card">
+                      <div class="hdhive-resolve-preview-head">
+                        <span
+                          class="hdhive-resolve-outcome"
+                          :class="'hdhive-resolve-outcome--' + (hdhiveRealUnlockResult.success ? 'auto_unlock' : 'fail')"
+                        >
+                          {{ hdhiveRealUnlockResult.success ? '真实解锁成功' : '真实解锁未成功' }}
+                        </span>
+                        <p class="hdhive-resolve-summary panel-subtext">
+                          <template v-if="hdhiveRealUnlockResult.success">与 Worker 一致的解锁直链如下。</template>
+                          <template v-else-if="hdhiveRealUnlockResult.skipped_reason">
+                            跳过：<code>{{ hdhiveRealUnlockResult.skipped_reason }}</code>
+                          </template>
+                          <template v-else-if="hdhiveRealUnlockResult.error_message">
+                            {{ hdhiveRealUnlockResult.error_message }}
+                          </template>
+                          <template v-else>请查看提示或日志。</template>
+                        </p>
+                      </div>
+                      <p v-if="hdhiveRealUnlockResult.success && hdhiveRealUnlockResult.share_link" class="panel-subtext" style="word-break: break-all">
+                        <strong>解锁直链：</strong><code>{{ hdhiveRealUnlockResult.share_link }}</code>
+                      </p>
+                      <p v-if="hdhiveRealUnlockResult.slug" class="panel-subtext">
+                        slug：<code>{{ hdhiveRealUnlockResult.slug }}</code>
                       </p>
                     </div>
                   </div>
@@ -2246,6 +2329,9 @@ createApp({
                       <input type="checkbox" v-model="rule.hdhive_require_rule_match" :disabled="!rule.hdhive_resource_resolve_forward" />
                       <span>仅当命中下方关键词/正则时才转发 HDHive（须至少填写「命中任一」或「必须全部」或正则之一）</span>
                     </label>
+                    <p class="panel-subtext span-2">
+                      直链解锁读「站点设置」中的 API Key 与 <code>HDHIVE_BASE_URL</code> 等，与<strong>测试签到</strong>是否成功无关。
+                    </p>
                     <label class="span-2">
                       <span>自定义正则：命中任一才转发</span>
                       <textarea

@@ -47,15 +47,15 @@ function createConfig() {
     hdhive_checkin_method: "api_key",
     hdhive_api_key: "",
     hdhive_cookie: "",
+    hdhive_login_username: "",
+    hdhive_login_password: "",
     hdhive_checkin_enabled: false,
     hdhive_checkin_gambler: false,
-    hdhive_checkin_use_proxy: false,
+    hdhive_checkin_use_proxy: true,
     hdhive_resource_unlock_enabled: false,
     hdhive_resource_unlock_max_points: 0,
     hdhive_resource_unlock_threshold_inclusive: true,
     hdhive_resource_unlock_skip_unknown_points: false,
-    hdhive_cookie_refresh_enabled: false,
-    hdhive_cookie_refresh_interval_sec: 1800,
   };
 }
 
@@ -199,13 +199,15 @@ export default {
       validating: false,
       actionBusy: false,
       hdhiveCheckinBusy: false,
-      hdhiveRefreshCookieBusy: false,
       hdhiveTestBusy: false,
       hdhiveResolveBusy: false,
+      hdhiveResolveUnlockBusy: false,
       hdhiveResolveTestUrl: "",
       hdhiveResolveResult: "",
       hdhiveResolvePreview: null,
-      /** API Key / Cookie / Next 头：整块默认折叠（隐私）；展开后直接编辑，无二次显示隐藏 */
+      /** 真实解锁测试（与规则转发一致，会扣积分） */
+      hdhiveRealUnlockResult: null,
+      /** API Key、网页登录凭据、Cookie 等：整块默认折叠（隐私）；展开后直接编辑，无二次显示隐藏 */
       hdhiveCredentialsOpen: false,
       authBusy: false,
       authed: false,
@@ -407,9 +409,10 @@ export default {
     hdhiveOutcomeLabel() {
       const o = this.hdhiveResolvePreview?.outcome;
       const map = {
-        direct: "Cookie 直连（免积分）",
-        openapi: "将回退 OpenAPI 积分解锁",
-        fail: "直链不可用 / 不会自动解锁",
+        direct: "旧模式：Cookie 直连",
+        auto_unlock: "将回退自动解锁（自动解锁规则）",
+        openapi: "将回退自动解锁（自动解锁规则）",
+        fail: "不会自动解锁",
         invalid_url: "链接无效",
       };
       return map[o] || "检测结果";
@@ -735,6 +738,8 @@ export default {
         hdhive_checkin_method: String(payload.hdhive_checkin_method ?? "api_key").trim() || "api_key",
         hdhive_api_key: String(payload.hdhive_api_key ?? "").trim(),
         hdhive_cookie: String(payload.hdhive_cookie ?? "").trim(),
+        hdhive_login_username: String(payload.hdhive_login_username ?? "").trim(),
+        hdhive_login_password: String(payload.hdhive_login_password ?? "").trim(),
         hdhive_checkin_enabled: Boolean(payload.hdhive_checkin_enabled),
         hdhive_checkin_gambler: Boolean(payload.hdhive_checkin_gambler),
         hdhive_checkin_use_proxy: Boolean(payload.hdhive_checkin_use_proxy),
@@ -903,9 +908,9 @@ export default {
       }
       if (typeof value === "object") {
         return (
-          this.stringifyErrorPart(value.detail) ||
-          this.stringifyErrorPart(value.message) ||
           this.stringifyErrorPart(value.msg) ||
+          this.stringifyErrorPart(value.message) ||
+          this.stringifyErrorPart(value.detail) ||
           this.stringifyErrorPart(value.error) ||
           this.stringifyErrorPart(value.reason) ||
           JSON.stringify(value)
@@ -1292,9 +1297,31 @@ export default {
         credentials: "include",
         headers: mergedHeaders,
       });
-      const payload = await response.json().catch(() => ({}));
+      const rawText = await response.text();
+      const trimmed = rawText.trim();
+      let payload = {};
+      if (trimmed) {
+        try {
+          payload = JSON.parse(rawText);
+        } catch (_e) {
+          if (!response.ok) {
+            const statusLine = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+            throw new Error(`${statusLine}：${trimmed.slice(0, 800)}`);
+          }
+          throw new Error(`响应不是合法 JSON（HTTP ${response.status}）`);
+        }
+      }
       if (!response.ok) {
-        throw new Error(this.formatApiError(payload));
+        const formatted = this.formatApiError(payload);
+        if (formatted && formatted !== "请求失败") {
+          throw new Error(formatted);
+        }
+        const statusLine = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+        throw new Error(
+          trimmed
+            ? `${statusLine}（响应不是标准 JSON，无法解析错误详情）`
+            : `${statusLine}（无响应正文；多为未连上后端、反代超时或服务未启动）`,
+        );
       }
       return payload;
     },
@@ -1637,10 +1664,6 @@ export default {
         0,
         Math.floor(Number(this.config.hdhive_resource_unlock_max_points) || 0),
       );
-      this.config.hdhive_cookie_refresh_interval_sec = Math.max(
-        60,
-        Math.min(86400, Math.floor(Number(this.config.hdhive_cookie_refresh_interval_sec) || 1800)),
-      );
       const rules = Array.isArray(this.config.rules)
         ? this.config.rules.map((rule, index) => this.normalizeRule(rule, index))
         : [createRule("rule_1")];
@@ -1668,6 +1691,8 @@ export default {
         hdhive_checkin_method: String(this.config.hdhive_checkin_method ?? "api_key").trim() || "api_key",
         hdhive_api_key: String(this.config.hdhive_api_key ?? "").trim(),
         hdhive_cookie: String(this.config.hdhive_cookie ?? "").trim(),
+        hdhive_login_username: String(this.config.hdhive_login_username ?? "").trim(),
+        hdhive_login_password: String(this.config.hdhive_login_password ?? "").trim(),
         hdhive_checkin_enabled: Boolean(this.config.hdhive_checkin_enabled),
         hdhive_checkin_gambler: Boolean(this.config.hdhive_checkin_gambler),
         hdhive_checkin_use_proxy: Boolean(this.config.hdhive_checkin_use_proxy),
@@ -1679,8 +1704,6 @@ export default {
         hdhive_resource_unlock_skip_unknown_points: Boolean(
           this.config.hdhive_resource_unlock_skip_unknown_points,
         ),
-        hdhive_cookie_refresh_enabled: Boolean(this.config.hdhive_cookie_refresh_enabled),
-        hdhive_cookie_refresh_interval_sec: this.config.hdhive_cookie_refresh_interval_sec,
         rules,
       };
     },
@@ -1709,7 +1732,7 @@ export default {
       if (this._looksLikeHdhiveRscBody(bodyStr)) {
         return (
           String(response.message || "").trim() ||
-          "服务端返回了 Next.js 页面数据流（RSC），已隐藏原始正文。请更新并保存 HDHIVE_COOKIE；若站点大改版，需更新程序内置签到元数据。"
+          "服务端返回了 Next.js 页面数据流（RSC），已隐藏原始正文。请检查网页登录账号或 API Key；若站点大改版，可在 .env 填写 HDHIVE_CHECKIN_NEXT_*。"
         );
       }
       let parsed = null;
@@ -1738,12 +1761,13 @@ export default {
       this.notice = "";
       this.error = "";
       try {
+        await this.saveConfig({ throwOnError: true, silent: true });
         const response = await this.fetchJson("/api/hdhive/checkin-now", { method: "POST" });
         const notice = String(
           this._hdhiveCheckinNoticeFromResponse(response) || response.message || "已完成请求。",
         );
         this.notice = notice;
-        if (notice.includes("已根据响应 Set-Cookie")) {
+        if (notice.includes("HDHIVE_COOKIE")) {
           await this.fetchConfig();
         }
       } catch (err) {
@@ -1752,33 +1776,20 @@ export default {
         this.hdhiveCheckinBusy = false;
       }
     },
-    async triggerHdhiveRefreshCookie() {
-      this.hdhiveRefreshCookieBusy = true;
-      this.notice = "";
-      this.error = "";
-      try {
-        const response = await this.fetchJson("/api/hdhive/refresh-cookie", { method: "POST" });
-        this.notice = String(response.message || "已完成请求。");
-        if (response.data && response.data.updated) {
-          await this.fetchConfig();
-        }
-      } catch (err) {
-        this.error = this.normalizeCaughtError(err);
-      } finally {
-        this.hdhiveRefreshCookieBusy = false;
-      }
-    },
     async triggerHdhiveCheckinTest() {
       this.hdhiveTestBusy = true;
       this.notice = "";
       this.error = "";
       try {
+        await this.saveConfig({ throwOnError: true, silent: true });
         const response = await this.fetchJson("/api/hdhive/checkin-test", {
           method: "POST",
           body: JSON.stringify({
             checkin_method: String(this.config.hdhive_checkin_method ?? "api_key").trim() || "api_key",
             api_key: String(this.config.hdhive_api_key ?? "").trim(),
             cookie: String(this.config.hdhive_cookie ?? "").trim(),
+            login_username: String(this.config.hdhive_login_username ?? "").trim(),
+            login_password: String(this.config.hdhive_login_password ?? "").trim(),
             is_gambler: Boolean(this.config.hdhive_checkin_gambler),
           }),
         });
@@ -1786,7 +1797,7 @@ export default {
           this._hdhiveCheckinNoticeFromResponse(response) || response.message || "测试请求已完成。",
         );
         this.notice = notice;
-        if (notice.includes("已根据响应 Set-Cookie")) {
+        if (notice.includes("HDHIVE_COOKIE")) {
           await this.fetchConfig();
         }
       } catch (err) {
@@ -1799,6 +1810,7 @@ export default {
       this.hdhiveResolveBusy = true;
       this.hdhiveResolveResult = "";
       this.hdhiveResolvePreview = null;
+      this.hdhiveRealUnlockResult = null;
       this.notice = "";
       this.error = "";
       try {
@@ -1812,6 +1824,9 @@ export default {
           body: JSON.stringify({ url }),
         });
         const preview = response.data?.preview ?? null;
+        if (preview && typeof preview === "object" && !preview.auto_unlock_preview && preview.openapi_preview) {
+          preview.auto_unlock_preview = preview.openapi_preview;
+        }
         this.hdhiveResolvePreview = preview && typeof preview === "object" ? preview : null;
         const got = String(response.data?.redirect_url ?? "").trim();
         this.hdhiveResolveResult = got;
@@ -1822,19 +1837,60 @@ export default {
         this.hdhiveResolveBusy = false;
       }
     },
+    async triggerHdhiveResolveUnlockTest() {
+      const url = String(this.hdhiveResolveTestUrl ?? "").trim();
+      if (!url) {
+        this.error = "请先粘贴 hdhive.com/resource/... 链接。";
+        return;
+      }
+      const ok = window.confirm(
+        "将按与「HDHive 专用直链转发」相同的逻辑真实调用解锁接口，可能消耗积分。确定继续？",
+      );
+      if (!ok) {
+        return;
+      }
+      this.hdhiveResolveUnlockBusy = true;
+      this.hdhiveRealUnlockResult = null;
+      this.notice = "";
+      this.error = "";
+      try {
+        const response = await this.fetchJson("/api/hdhive/resolve-unlock-test", {
+          method: "POST",
+          body: JSON.stringify({ url }),
+        });
+        const d = response.data || {};
+        this.hdhiveRealUnlockResult = {
+          success: Boolean(d.success),
+          share_link: String(d.share_link || "").trim(),
+          skipped_reason: String(d.skipped_reason || "").trim(),
+          error_message: String(d.error_message || "").trim(),
+          slug: String(d.slug || "").trim(),
+        };
+        this.notice = String(response.message || "").trim() || (d.success ? "已获取直链。" : "解锁未完成。");
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.hdhiveResolveUnlockBusy = false;
+      }
+    },
     async saveConfig(options = {}) {
       const successMessage = options.successMessage || "";
       const throwOnError = Boolean(options.throwOnError);
+      const silent = Boolean(options.silent);
       this.saving = true;
-      this.notice = "";
-      this.error = "";
+      if (!silent) {
+        this.notice = "";
+        this.error = "";
+      }
       try {
         const payload = this.buildSaveConfigPayload();
         const response = await this.fetchJson("/api/config", {
           method: "POST",
           body: JSON.stringify(payload),
         });
-        this.notice = successMessage || response.message;
+        if (!silent) {
+          this.notice = successMessage || response.message;
+        }
         await this.fetchConfig();
       } catch (err) {
         this.error = this.normalizeCaughtError(err);

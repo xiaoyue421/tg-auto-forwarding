@@ -17,6 +17,7 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 import urllib.error
 import urllib.request
@@ -24,6 +25,11 @@ import urllib.request
 from telethon.tl.custom.message import Message
 
 from tg_forwarder.config import ProxyConfig
+from tg_forwarder.hdhive_unlock_core import (
+    classify_share_for_auto_unlock,
+    extract_share_link_from_unlock_response,
+    preview_decision_from_share_data,
+)
 from tg_forwarder.hdhive_checkin import _build_proxy_opener
 from tg_forwarder.message_index import extract_message_keyword_values, extract_urls_from_text
 
@@ -302,6 +308,237 @@ def build_hdhive_openapi_unlock_url(openapi_base: str) -> str:
     return f"{base}/api/open/resources/unlock"
 
 
+def build_hdhive_openapi_share_detail_url(openapi_base: str, slug: str) -> str:
+    base = str(openapi_base or "").strip().rstrip("/")
+    if not base:
+        base = _DEFAULT_HDHIVE_OPENAPI_BASE
+    return f"{base}/api/open/shares/{normalize_hdhive_openapi_slug(slug)}"
+
+
+@dataclass(slots=True)
+class HDHiveCSUnlockResult:
+    success: bool
+    share_link: str
+    error_message: str
+    skipped_reason: str = ""
+
+
+def _post_json_sync(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    api_key: str,
+    access_token: str = "",
+    proxy: ProxyConfig | None,
+    timeout_seconds: float,
+) -> tuple[bool, dict[str, Any], str]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-Key": str(api_key or "").strip(),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        ),
+    }
+    token = str(access_token or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    opener = _build_proxy_opener(proxy, follow_redirects=True)
+    try:
+        with opener.open(req, timeout=timeout_seconds) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            status = int(getattr(resp, "status", None) or resp.getcode() or 0)
+    except http.client.HTTPException as exc:
+        return False, {}, str(exc)
+    except urllib.error.HTTPError as exc:
+        try:
+            text = exc.read().decode("utf-8", errors="replace")
+        except OSError:
+            text = ""
+        return False, {}, f"HTTP错误: {exc.code} {text[:220]}"
+    except OSError as exc:
+        return False, {}, str(exc)
+    if status < 200 or status >= 300:
+        return False, {}, f"HTTP错误: {status}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False, {}, f"响应非 JSON: {text[:220]}"
+    if not isinstance(data, dict):
+        return False, {}, "响应格式错误"
+    return True, data, ""
+
+
+def _get_json_sync(
+    url: str,
+    *,
+    api_key: str,
+    access_token: str = "",
+    proxy: ProxyConfig | None,
+    timeout_seconds: float,
+) -> tuple[bool, dict[str, Any], str]:
+    headers = {
+        "Accept": "application/json",
+        "X-API-Key": str(api_key or "").strip(),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        ),
+    }
+    token = str(access_token or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    opener = _build_proxy_opener(proxy, follow_redirects=True)
+    try:
+        with opener.open(req, timeout=timeout_seconds) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            status = int(getattr(resp, "status", None) or resp.getcode() or 0)
+    except http.client.HTTPException as exc:
+        return False, {}, str(exc)
+    except urllib.error.HTTPError as exc:
+        try:
+            text = exc.read().decode("utf-8", errors="replace")
+        except OSError:
+            text = ""
+        return False, {}, f"HTTP错误: {exc.code} {text[:220]}"
+    except OSError as exc:
+        return False, {}, str(exc)
+    if status < 200 or status >= 300:
+        return False, {}, f"HTTP错误: {status}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return False, {}, f"响应非 JSON: {text[:220]}"
+    if not isinstance(data, dict):
+        return False, {}, "响应格式错误"
+    return True, data, ""
+
+
+def unlock_hdhive_resource_via_cs_rule_sync(
+    *,
+    slug: str,
+    api_key: str,
+    proxy: ProxyConfig | None,
+    timeout_seconds: float = 30.0,
+    openapi_base_url: str | None = None,
+    access_token: str = "",
+    allow_paid: bool = False,
+    max_points: int | None = None,
+) -> HDHiveCSUnlockResult:
+    """
+    Align with hdhive/auto_unlock.py:
+    1) GET share detail
+    2) auto unlock when free, or when allow_paid and unlock_points <= max_points
+    """
+    normalized_slug = normalize_hdhive_openapi_slug(slug)
+    normalized_api_key = str(api_key or "").strip()
+    if not normalized_slug:
+        return HDHiveCSUnlockResult(False, "", "缺少资源 slug")
+    if not normalized_api_key:
+        return HDHiveCSUnlockResult(False, "", "缺少 HDHIVE_API_KEY")
+
+    base = (openapi_base_url or "").strip().rstrip("/") or _DEFAULT_HDHIVE_OPENAPI_BASE
+    share_detail_url = build_hdhive_openapi_share_detail_url(base, normalized_slug)
+    unlock_url = build_hdhive_openapi_unlock_url(base)
+
+    ok_share, share_resp, share_err = _get_json_sync(
+        share_detail_url,
+        api_key=normalized_api_key,
+        access_token=access_token,
+        proxy=proxy,
+        timeout_seconds=timeout_seconds,
+    )
+    if not ok_share:
+        return HDHiveCSUnlockResult(False, "", share_err or "读取资源详情失败")
+    if share_resp.get("success") is False:
+        msg = str(share_resp.get("message") or "").strip()
+        desc = str(share_resp.get("description") or "").strip()
+        return HDHiveCSUnlockResult(False, "", desc or msg or "读取资源详情失败")
+
+    share_data = share_resp.get("data")
+    if not isinstance(share_data, dict):
+        share_data = {}
+    should_unlock, skip_reason = classify_share_for_auto_unlock(
+        share_data,
+        allow_paid=allow_paid,
+        max_points=max_points,
+    )
+    if not should_unlock:
+        return HDHiveCSUnlockResult(False, "", "", skipped_reason=skip_reason)
+
+    ok_unlock, unlock_resp, unlock_err = _post_json_sync(
+        unlock_url,
+        payload={"slug": normalized_slug},
+        api_key=normalized_api_key,
+        access_token=access_token,
+        proxy=proxy,
+        timeout_seconds=timeout_seconds,
+    )
+    if not ok_unlock:
+        return HDHiveCSUnlockResult(False, "", unlock_err or "OpenAPI 解锁失败")
+    if unlock_resp.get("success") is False:
+        msg = str(unlock_resp.get("message") or "").strip()
+        desc = str(unlock_resp.get("description") or "").strip()
+        return HDHiveCSUnlockResult(False, "", desc or msg or "OpenAPI 解锁失败")
+    share_link = extract_share_link_from_unlock_response(unlock_resp)
+    if not share_link:
+        msg = str(unlock_resp.get("message") or "").strip()
+        return HDHiveCSUnlockResult(False, "", msg or "OpenAPI 解锁后未返回可用链接")
+    return HDHiveCSUnlockResult(True, share_link, "")
+
+
+def preview_hdhive_cs_rule_decision_sync(
+    *,
+    slug: str,
+    api_key: str,
+    proxy: ProxyConfig | None,
+    timeout_seconds: float = 30.0,
+    openapi_base_url: str | None = None,
+    access_token: str = "",
+    allow_paid: bool = False,
+    max_points: int | None = None,
+) -> tuple[bool, int | None, str]:
+    """
+    Read share detail only (no unlock call), then evaluate auto unlock decision rule.
+    Returns (would_unlock, unlock_points, skip_reason).
+    """
+    normalized_slug = normalize_hdhive_openapi_slug(slug)
+    normalized_api_key = str(api_key or "").strip()
+    if not normalized_slug:
+        return False, None, "no_slug"
+    if not normalized_api_key:
+        return False, None, "no_api_key"
+
+    base = (openapi_base_url or "").strip().rstrip("/") or _DEFAULT_HDHIVE_OPENAPI_BASE
+    share_detail_url = build_hdhive_openapi_share_detail_url(base, normalized_slug)
+    ok_share, share_resp, share_err = _get_json_sync(
+        share_detail_url,
+        api_key=normalized_api_key,
+        access_token=access_token,
+        proxy=proxy,
+        timeout_seconds=timeout_seconds,
+    )
+    if not ok_share:
+        return False, None, share_err or "share_detail_error"
+    if share_resp.get("success") is False:
+        msg = str(share_resp.get("message") or "").strip()
+        desc = str(share_resp.get("description") or "").strip()
+        return False, None, desc or msg or "share_detail_error"
+
+    share_data = share_resp.get("data")
+    if not isinstance(share_data, dict):
+        share_data = {}
+    return preview_decision_from_share_data(
+        share_data,
+        allow_paid=allow_paid,
+        max_points=max_points,
+    )
+
+
 def unlock_hdhive_resource_via_open_api_sync(
     *,
     slug: str,
@@ -317,76 +554,21 @@ def unlock_hdhive_resource_via_open_api_sync(
 
     Returns (success, share_link, error_message).
     """
-    normalized_slug = normalize_hdhive_openapi_slug(slug)
-    normalized_api_key = str(api_key or "").strip()
-    if not normalized_slug:
-        return False, "", "缺少资源 slug"
-    if not normalized_api_key:
-        return False, "", "缺少 HDHIVE_API_KEY"
-
-    base = (openapi_base_url or "").strip().rstrip("/") or _DEFAULT_HDHIVE_OPENAPI_BASE
-    unlock_url = build_hdhive_openapi_unlock_url(base)
-
-    payload = json.dumps({"slug": normalized_slug}, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-API-Key": normalized_api_key,
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-        ),
-    }
-    req = urllib.request.Request(
-        unlock_url,
-        data=payload,
-        headers=headers,
-        method="POST",
+    cs_result = unlock_hdhive_resource_via_cs_rule_sync(
+        slug=slug,
+        api_key=api_key,
+        proxy=proxy,
+        timeout_seconds=timeout_seconds,
+        openapi_base_url=openapi_base_url,
+        # Keep backward compatibility: old API always attempted paid unlock.
+        allow_paid=True,
+        max_points=2_147_483_647,
     )
-    opener = _build_proxy_opener(proxy, follow_redirects=True)
-    try:
-        with opener.open(req, timeout=timeout_seconds) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            status = int(getattr(resp, "status", None) or resp.getcode() or 0)
-    except http.client.HTTPException as exc:
-        return False, "", str(exc)
-    except urllib.error.HTTPError as exc:
-        try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except OSError:
-            body = ""
-        return False, "", f"HTTP错误: {exc.code} {body[:220]}"
-    except OSError as exc:
-        return False, "", str(exc)
-
-    if status < 200 or status >= 300:
-        return False, "", f"HTTP错误: {status}"
-
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError:
-        return False, "", f"响应非 JSON: {body[:220]}"
-    if not isinstance(data, dict):
-        return False, "", "响应格式错误"
-
-    if data.get("success") is False:
-        msg = str(data.get("message") or "").strip()
-        desc = str(data.get("description") or "").strip()
-        return False, "", (desc or msg or "OpenAPI 解锁失败")
-
-    payload_data = data.get("data")
-    if not isinstance(payload_data, dict):
-        payload_data = {}
-    share_link = str(payload_data.get("full_url") or payload_data.get("url") or "").strip()
-    access_code = str(payload_data.get("access_code") or "").strip()
-    if not share_link and str(payload_data.get("url") or "").strip() and access_code:
-        base = str(payload_data.get("url") or "").strip()
-        joiner = "&" if "?" in base else "?"
-        share_link = f"{base}{joiner}password={access_code}"
-    if not share_link:
-        msg = str(data.get("message") or "").strip()
-        return False, "", (msg or "OpenAPI 解锁后未返回可用链接")
-    return True, share_link, ""
+    if cs_result.success:
+        return True, cs_result.share_link, ""
+    if cs_result.skipped_reason:
+        return False, "", "按规则跳过自动解锁"
+    return False, "", (cs_result.error_message or "OpenAPI 解锁失败")
 
 
 def preview_hdhive_resource_forward_sync(
@@ -400,10 +582,12 @@ def preview_hdhive_resource_forward_sync(
     unlock_skip_unknown: bool,
     proxy: ProxyConfig | None,
     timeout_seconds: float = 30.0,
+    openapi_base_url: str | None = None,
+    access_token: str = "",
 ) -> dict[str, Any]:
     """
-    Simulate the forwarder path (Cookie NEXT_REDIRECT first, then unlock policy) without calling
-    OpenAPI unlock — avoids spending points. Used by the dashboard “转发路径检测”.
+    Simulate API-only auto unlock policy without calling unlock API (no points consumed).
+    Used by the dashboard “转发路径检测”.
     """
     url_norm = str(url or "").strip()
     low = url_norm.lower()
@@ -428,7 +612,7 @@ def preview_hdhive_resource_forward_sync(
             "outcome": outcome,
             "summary": summary,
             "direct": {
-                "attempted": bool((cookie or "").strip()),
+                "attempted": False,
                 "ok": direct_ok,
                 "error": direct_error or "",
                 "redirect_url": redirect_url or "",
@@ -439,7 +623,13 @@ def preview_hdhive_resource_forward_sync(
             "openapi_preview": {
                 "would_attempt": openapi_would_attempt,
                 "skip_reason": openapi_skip_reason or "",
-                "note": "预览未调用 OpenAPI 解锁接口，不会消耗积分。",
+                "note": "预览未调用 API 解锁接口，不会消耗积分。",
+            },
+            # New naming for frontend readability; keep openapi_preview for compatibility.
+            "auto_unlock_preview": {
+                "would_attempt": openapi_would_attempt,
+                "skip_reason": openapi_skip_reason or "",
+                "note": "预览未调用 API 解锁接口，不会消耗积分。",
             },
             "detail_lines": lines,
         }
@@ -458,74 +648,32 @@ def preview_hdhive_resource_forward_sync(
             "openapi_preview": {
                 "would_attempt": False,
                 "skip_reason": "",
-                "note": "预览未调用 OpenAPI 解锁接口，不会消耗积分。",
+                "note": "预览未调用 API 解锁接口，不会消耗积分。",
+            },
+            "auto_unlock_preview": {
+                "would_attempt": False,
+                "skip_reason": "",
+                "note": "预览未调用 API 解锁接口，不会消耗积分。",
             },
             "detail_lines": [],
         }
 
-    cookie_s = (cookie or "").strip()
     api_s = (api_key or "").strip()
     slug_raw = extract_hdhive_resource_slug(url_norm)
     slug_norm = normalize_hdhive_openapi_slug(slug_raw)
 
-    page_text = ""
-    direct_ok = False
-    redirect_url = ""
-    direct_err = ""
-
-    if cookie_s:
-        direct_ok, redirect_url, direct_err, page_text = resolve_hdhive_resource_redirect_sync(
-            url_norm,
-            cookie_header=cookie_s,
-            proxy=proxy,
-            timeout_seconds=timeout_seconds,
-        )
-        if direct_ok and (redirect_url or "").strip():
-            lines.append("Cookie 直链：已从页面解析到 NEXT_REDIRECT（免积分）。")
-            return _finish(
-                outcome="direct",
-                summary="将走 Cookie 直连（免积分），转发内容应为解析后的直链。",
-                direct_ok=True,
-                redirect_url=(redirect_url or "").strip(),
-                direct_error="",
-                unlock_points=extract_unlock_points_from_hdhive_resource_html(page_text),
-                openapi_would_attempt=False,
-            )
-        lines.append(f"Cookie 直链失败：{direct_err or '未知错误'}。")
-    else:
-        direct_err = "未配置 Cookie，未尝试 Cookie 直链（可在站点设置保存 HDHIVE_COOKIE 后重测）。"
-        lines.append(direct_err)
-
-    if not (page_text or "").strip():
-        probe_text, probe_err = load_hdhive_resource_page_text_sync(
-            url_norm,
-            cookie_header=cookie_s,
-            proxy=proxy,
-            timeout_seconds=timeout_seconds,
-        )
-        page_text = probe_text
-        if probe_err:
-            lines.append(f"抓取资源页：{probe_err}")
-
-    unlock_points = extract_unlock_points_from_hdhive_resource_html(page_text)
-    if unlock_points is not None:
-        lines.append(f"页面解析到的 unlock_points：{unlock_points}（仅供参考，以实际转发时为准）。")
-    elif (page_text or "").strip():
-        lines.append("未能从页面 HTML 解析 unlock_points（站点结构变化或需登录可见）。")
-    else:
-        lines.append("未能获取资源页正文，无法解析所需积分。")
-
+    unlock_points: int | None = None
+    direct_err = "已禁用 Cookie 直链；当前仅通过 API 自动解锁。"
+    lines.append(direct_err)
     page_probe_error = ""
-    if not (page_text or "").strip() and cookie_s:
-        page_probe_error = direct_err or "无法读取资源页"
 
     openapi_skip_reason = ""
     openapi_would_attempt = False
 
     if not unlock_enabled:
         openapi_skip_reason = "unlock_disabled"
-        lines.append("当前未开启「积分解锁回退」，直链失败时不会调用 OpenAPI。")
-        summary = "直链不可用且未开启积分解锁；实际转发会得到固定失败提示（不会发原链接）。"
+        lines.append("当前未开启「自动解锁回退」，不会调用 API 解锁。")
+        summary = "未开启自动解锁；实际转发会得到固定失败提示（不会发原链接）。"
         return _finish(
             outcome="fail",
             summary=summary,
@@ -539,8 +687,8 @@ def preview_hdhive_resource_forward_sync(
 
     if not api_s:
         openapi_skip_reason = "no_api_key"
-        lines.append("已开启积分解锁但未配置 API Key，无法走 OpenAPI。")
-        summary = "直链失败且无法积分解锁（缺少 API Key）。"
+        lines.append("已开启自动解锁但未配置 API Key，无法调用 API 解锁。")
+        summary = "无法自动解锁（缺少 API Key）。"
         return _finish(
             outcome="fail",
             summary=summary,
@@ -554,8 +702,8 @@ def preview_hdhive_resource_forward_sync(
 
     if not slug_norm:
         openapi_skip_reason = "no_slug"
-        lines.append("无法从链接提取资源 slug，OpenAPI 解锁无法调用。")
-        summary = "直链失败且无法解析资源 slug。"
+        lines.append("无法从链接提取资源 slug，API 解锁无法调用。")
+        summary = "无法解析资源 slug。"
         return _finish(
             outcome="fail",
             summary=summary,
@@ -567,30 +715,40 @@ def preview_hdhive_resource_forward_sync(
             openapi_skip_reason=openapi_skip_reason,
         )
 
-    allow_unlock, skip_reason = should_attempt_hdhive_openapi_unlock(
-        unlock_points,
-        max_points_per_item=max(0, int(unlock_max_points)),
-        threshold_inclusive=unlock_inclusive,
-        skip_when_points_unknown=unlock_skip_unknown,
+    max_points_limit = max(0, int(unlock_max_points))
+    paid_max_points = max_points_limit if max_points_limit > 0 else 2_147_483_647
+    base_url = (openapi_base_url or "").strip().rstrip("/") or effective_hdhive_openapi_base_url(None)
+    token_s = (access_token or "").strip()
+    allow_unlock, detail_unlock_points, skip_reason = preview_hdhive_cs_rule_decision_sync(
+        slug=slug_norm,
+        api_key=api_s,
+        proxy=proxy,
+        timeout_seconds=timeout_seconds,
+        openapi_base_url=base_url,
+        access_token=token_s,
+        allow_paid=True,
+        max_points=paid_max_points,
     )
+    if detail_unlock_points is not None:
+        unlock_points = detail_unlock_points
 
     if allow_unlock:
         openapi_would_attempt = True
         openapi_skip_reason = ""
         if unlock_points is None:
-            pts_hint = "所需积分未知（当前设置允许在未知时仍尝试解锁）"
+            pts_hint = "免费资源"
         else:
             pts_hint = f"所需积分约为 {unlock_points}"
         lines.append(
-            f"按当前上限规则：将尝试 OpenAPI 积分解锁（{pts_hint}）。"
-            " 实际转发时先直链失败后才会调用；此处预览不调用接口。"
+            f"按当前自动解锁规则：将尝试自动解锁（{pts_hint}）。"
+            " 实际转发时将直接调用 API 解锁；此处预览不调用接口。"
         )
         summary = (
-            f"直链不可用；将回退 OpenAPI 积分解锁（{pts_hint}）。"
+            f"将通过 API 自动解锁（{pts_hint}）。"
             " 请确认规则中已开启「HDHive 专用直链转发」。"
         )
         return _finish(
-            outcome="openapi",
+            outcome="auto_unlock",
             summary=summary,
             direct_ok=False,
             direct_error=direct_err,
@@ -603,17 +761,16 @@ def preview_hdhive_resource_forward_sync(
     openapi_skip_reason = skip_reason or "blocked"
     if skip_reason == "over_threshold":
         cap = max(0, int(unlock_max_points))
-        bound = "≤" if unlock_inclusive else "<"
         lines.append(
-            f"积分解锁已按上限跳过：资源约需 {unlock_points} 分，当前上限为 {bound} {cap}（0 表示不限制）。"
+            f"自动解锁已按上限跳过：资源约需 {unlock_points} 分，当前上限为 ≤ {cap}（0 表示不限制）。"
         )
-        summary = f"直链失败；积分解锁因超过上限被跳过（约需 {unlock_points} 分）。"
-    elif skip_reason == "unknown_points":
-        lines.append("积分解锁已跳过：无法解析所需积分，且已勾选「未知积分时跳过」。")
-        summary = "直链失败；因未知积分且保守策略，不会自动解锁。"
+        summary = f"自动解锁因超过上限被跳过（约需 {unlock_points} 分）。"
+    elif skip_reason == "unknown_or_not_free":
+        lines.append("自动解锁已跳过：当前资源不是免费资源，且无法读取可用积分。")
+        summary = "资源不满足自动解锁规则。"
     else:
-        lines.append("积分解锁不会执行（策略限制）。")
-        summary = "直链失败且不会自动积分解锁。"
+        lines.append("自动解锁不会执行（策略限制）。")
+        summary = "不会自动解锁。"
 
     return _finish(
         outcome="fail",
