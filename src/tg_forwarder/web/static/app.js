@@ -1928,8 +1928,9 @@ createApp({
                           <input v-model="config.hdhive_login_password" type="password" autocomplete="current-password" spellcheck="false" />
                         </label>
                         <p class="panel-subtext span-2">
-                          签到由服务端加载 <code>hdhive/hdhive_site_login_checkin.py</code>；可选在 .env 填写
-                          <code>HDHIVE_CHECKIN_NEXT_ACTION</code> 等覆盖内置解析。自动签到与测试/立即签到均只走账号密码登录。
+                          签到由服务端加载 <code>hdhive/hdhive_site_login_checkin.py</code>：先账号密码登录，再从登录态首页解析签到
+                          <code>Next-Action</code> 后 POST 签到。若解析失败，可在 .env 显式填写
+                          <code>HDHIVE_CHECKIN_NEXT_ACTION</code> 等覆盖。自动/测试/立即签到均走该流程。
                         </p>
                       </template>
                       <label class="span-2">

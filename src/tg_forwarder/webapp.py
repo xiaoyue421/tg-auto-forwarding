@@ -1200,17 +1200,31 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
 
-    def _hdhive_checkin_api_response(status: int, raw: str, title: str, desc: str) -> ApiResponse:
+    def _hdhive_checkin_api_response(
+        status: int,
+        raw: str,
+        title: str,
+        desc: str,
+        *,
+        checkin_ok: bool,
+        hdhive_cookie: str | None = None,
+        include_hdhive_cookie_field: bool = False,
+    ) -> ApiResponse:
         safe_title = (title or "").strip() or (f"HTTP {status}" if status > 0 else "请求结束")
-        return ApiResponse(
-            message=safe_title,
-            data={
-                "http_status": status,
-                "body": raw,
-                "checkin_message": title,
-                "checkin_description": desc,
-            },
-        )
+        data: dict = {
+            "http_status": status,
+            "body": raw,
+            "checkin_message": title,
+            "checkin_description": desc,
+            "checkin_ok": bool(checkin_ok),
+        }
+        ck = (hdhive_cookie or "").strip()
+        if include_hdhive_cookie_field:
+            # cookie 模式始终带上该键，便于前端回填；空串表示会话串未解析到（与「缺键」区分）
+            data["hdhive_cookie"] = ck
+        elif ck:
+            data["hdhive_cookie"] = ck
+        return ApiResponse(message=safe_title, data=data)
 
     @app.post("/api/hdhive/checkin-test")
     def hdhive_checkin_test(request: Request, payload: HdhiveCheckinTestPayload) -> ApiResponse:
@@ -1246,7 +1260,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         proxy, proxy_err = resolve_hdhive_proxy(values)
         if proxy_err:
             raise HTTPException(status_code=400, detail=translate_error(proxy_err))
-        status, raw, msg, desc, resp_hdrs, new_ck = run_hdhive_checkin(
+        status, raw, msg, desc, resp_hdrs, new_ck, checkin_ok = run_hdhive_checkin(
             method=method,
             api_key=api_key,
             cookie_header="",
@@ -1270,10 +1284,18 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                 cookie_updated = True
             except OSError as exc:
                 cookie_write_err = str(exc)
-        resp = _hdhive_checkin_api_response(status, raw, msg, desc)
+        resp = _hdhive_checkin_api_response(
+            status,
+            raw,
+            msg,
+            desc,
+            checkin_ok=checkin_ok,
+            hdhive_cookie=new_ck.strip(),
+            include_hdhive_cookie_field=(method == "cookie"),
+        )
         suffix_parts: list[str] = []
         if cookie_updated:
-            suffix_parts.append("已将会话 Cookie 写回 HDHIVE_COOKIE（请刷新页面加载最新配置）。")
+            suffix_parts.append("已将会话 Cookie 写回 HDHIVE_COOKIE；表单已同步显示。")
         elif cookie_write_err:
             suffix_parts.append(f"签到已完成但写回 HDHIVE_COOKIE 失败：{cookie_write_err}")
         if suffix_parts:
@@ -1305,7 +1327,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         proxy, proxy_err = resolve_hdhive_proxy(values)
         if proxy_err:
             raise HTTPException(status_code=400, detail=translate_error(proxy_err))
-        status, raw, msg, desc, resp_hdrs, new_ck = run_hdhive_checkin(
+        status, raw, msg, desc, resp_hdrs, new_ck, checkin_ok = run_hdhive_checkin(
             method=method,
             api_key=api_key,
             cookie_header="",
@@ -1329,10 +1351,18 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
                 cookie_updated = True
             except OSError as exc:
                 cookie_write_err = str(exc)
-        resp = _hdhive_checkin_api_response(status, raw, msg, desc)
+        resp = _hdhive_checkin_api_response(
+            status,
+            raw,
+            msg,
+            desc,
+            checkin_ok=checkin_ok,
+            hdhive_cookie=new_ck.strip(),
+            include_hdhive_cookie_field=(method == "cookie"),
+        )
         suffix_parts: list[str] = []
         if cookie_updated:
-            suffix_parts.append("已将会话 Cookie 写回 HDHIVE_COOKIE（请刷新页面加载最新配置）。")
+            suffix_parts.append("已将会话 Cookie 写回 HDHIVE_COOKIE；表单已同步显示。")
         elif cookie_write_err:
             suffix_parts.append(f"签到已完成但写回 HDHIVE_COOKIE 失败：{cookie_write_err}")
         if suffix_parts:

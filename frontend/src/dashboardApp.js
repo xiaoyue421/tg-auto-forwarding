@@ -213,6 +213,11 @@ export default {
       authed: false,
       passwordInput: "",
       notice: "",
+      /** HDHive 签到：与接口 data.checkin_message / checkin_description 对应（标题 / 正文） */
+      noticeModalTitle: "",
+      noticeModalBody: "",
+      /** 与 data.checkin_ok === false 一致：弹窗用错误样式（避免 HTTP 200 仍显示绿勾） */
+      noticeModalIsError: false,
       error: "",
       configPath: "",
       defaultStartupNotifyMessage: "",
@@ -498,17 +503,25 @@ export default {
   },
   watch: {
     notice(val) {
-      if (this.noticeDismissTimer) {
+      if (String(val || "").trim()) {
+        this.noticeModalTitle = "";
+        this.noticeModalBody = "";
+        this.noticeModalIsError = false;
+      }
+      this._armNoticeAutoDismiss();
+    },
+    noticeModalTitle() {
+      this._armNoticeAutoDismiss();
+    },
+    noticeModalBody() {
+      this._armNoticeAutoDismiss();
+    },
+    noticeModalIsError(val) {
+      if (val && this.noticeDismissTimer) {
         clearTimeout(this.noticeDismissTimer);
         this.noticeDismissTimer = null;
-      }
-      if (val && !this.error) {
-        this.noticeDismissTimer = setTimeout(() => {
-          this.noticeDismissTimer = null;
-          if (this.notice === val) {
-            this.notice = "";
-          }
-        }, 5200);
+      } else if (!val) {
+        this._armNoticeAutoDismiss();
       }
     },
     error(val) {
@@ -568,7 +581,71 @@ export default {
         this.noticeDismissTimer = null;
       }
       this.notice = "";
+      this.noticeModalTitle = "";
+      this.noticeModalBody = "";
+      this.noticeModalIsError = false;
       this.error = "";
+    },
+    _armNoticeAutoDismiss() {
+      if (this.noticeDismissTimer) {
+        clearTimeout(this.noticeDismissTimer);
+        this.noticeDismissTimer = null;
+      }
+      if (this.error || this.noticeModalIsError) {
+        return;
+      }
+      const has =
+        String(this.notice || "").trim() ||
+        String(this.noticeModalTitle || "").trim() ||
+        String(this.noticeModalBody || "").trim();
+      if (!has) {
+        return;
+      }
+      this.noticeDismissTimer = setTimeout(() => {
+        this.noticeDismissTimer = null;
+        this.dismissMessage();
+      }, 5200);
+    },
+    _applyHdhiveCheckinNoticeModal(response) {
+      const title = String(response.data?.checkin_message ?? "").trim();
+      const desc = String(response.data?.checkin_description ?? "").trim();
+      const merged = String(
+        this._hdhiveCheckinNoticeFromResponse(response) || response.message || "",
+      ).trim();
+      const envTop = String(response.message || "").trim();
+      this.notice = "";
+      this.noticeModalTitle = "";
+      this.noticeModalBody = "";
+      this.noticeModalIsError = false;
+      if (title || desc) {
+        // 正文以 data.checkin_message / checkin_description 为准（与 CLI 空格拼接一行一致）
+        const oneLine = [title, desc].filter(Boolean).join(" ").trim();
+        let extra = "";
+        if (envTop && envTop !== oneLine) {
+          const stripLead = (s, prefix) =>
+            String(s || "")
+              .trim()
+              .slice(String(prefix || "").length)
+              .trim()
+              .replace(/^[\s,，.。;；\-—]+/, "");
+          if (oneLine && envTop.startsWith(oneLine)) {
+            extra = stripLead(envTop, oneLine);
+          } else if (title && envTop.startsWith(title)) {
+            const rest = stripLead(envTop, title);
+            if (rest && rest !== desc) {
+              extra = rest;
+            }
+          } else if (!(title && envTop === title)) {
+            extra = envTop;
+          }
+        }
+        this.noticeModalTitle = "提示";
+        this.noticeModalBody = [oneLine, extra].filter(Boolean).join("\n\n").trim();
+        this.noticeModalIsError = response.data?.checkin_ok === false;
+      } else {
+        this.notice = merged || envTop || "已完成请求。";
+      }
+      this._armNoticeAutoDismiss();
     },
     handleMessageEscape(e) {
       if (e.key !== "Escape") {
@@ -582,7 +659,7 @@ export default {
         this.closeMobileNav();
         return;
       }
-      if (this.notice || this.error) {
+      if (this.notice || this.error || this.noticeModalTitle || this.noticeModalBody || this.noticeModalIsError) {
         this.dismissMessage();
       }
     },
@@ -1716,23 +1793,37 @@ export default {
       return keys.filter((k) => s.includes(k)).length >= 2;
     },
     _hdhiveCheckinNoticeFromResponse(response) {
+      const apiMsg = String(response.message || "").trim();
       const title = String(response.data?.checkin_message ?? "").trim();
       const desc = String(response.data?.checkin_description ?? "").trim();
-      if (title && desc) {
-        return `${title}\n\n${desc}`;
+      /** 顶层 ApiResponse.message 常带「写回 Cookie」等补充句；仅用 data.checkin_message 会只剩「签到完成」。 */
+      const mergeCheckinEnvelope = (detail) => {
+        const d = String(detail || "").trim();
+        const e = apiMsg;
+        if (!d) return e;
+        if (!e) return d;
+        if (e === d || e.includes(d)) return e;
+        const first = d.split(/\n/)[0].trim();
+        if (first && e.startsWith(first) && e.length > first.length && !d.includes("\n\n")) return e;
+        if (d !== e) return `${d}\n\n${e}`.trim();
+        return d;
+      };
+
+      let detail = "";
+      if (title && desc) detail = `${title}\n\n${desc}`;
+      else if (title) detail = title;
+      else if (desc) detail = desc;
+
+      if (detail) {
+        return mergeCheckinEnvelope(detail);
       }
-      if (title) {
-        return title;
-      }
-      if (desc) {
-        return desc;
-      }
+
       const bodyRaw = response.data?.body ?? "";
       const bodyStr = typeof bodyRaw === "string" ? bodyRaw : String(bodyRaw ?? "");
       if (this._looksLikeHdhiveRscBody(bodyStr)) {
-        return (
+        return mergeCheckinEnvelope(
           String(response.message || "").trim() ||
-          "服务端返回了 Next.js 页面数据流（RSC），已隐藏原始正文。请检查网页登录账号或 API Key；若站点大改版，可在 .env 填写 HDHIVE_CHECKIN_NEXT_*。"
+            "服务端返回了 Next.js 页面数据流（RSC），已隐藏原始正文。请检查网页登录账号或 API Key；若登录后仍无法解析签到元数据，可在 .env 显式填写 HDHIVE_CHECKIN_NEXT_*。",
         );
       }
       let parsed = null;
@@ -1743,32 +1834,49 @@ export default {
       }
       const fromJson = parsed && (parsed.message || parsed.data?.message);
       if (fromJson) {
-        return String(fromJson);
+        return mergeCheckinEnvelope(String(fromJson));
       }
       if (bodyStr.length > 0 && bodyStr.length <= 400) {
-        return bodyStr;
+        return mergeCheckinEnvelope(bodyStr);
       }
       if (bodyStr.length > 400) {
-        return (
+        return mergeCheckinEnvelope(
           String(response.message || "").trim() ||
-          `响应较长（${bodyStr.length} 字符），未识别为 JSON；请查看日志或重试。`
+            `响应较长（${bodyStr.length} 字符），未识别为 JSON；请查看日志或重试。`,
         );
       }
-      return String(response.message || "").trim() || "";
+      return mergeCheckinEnvelope(String(response.message || "").trim() || "");
     },
     async triggerHdhiveCheckinNow() {
       this.hdhiveCheckinBusy = true;
       this.notice = "";
+      this.noticeModalTitle = "";
+      this.noticeModalBody = "";
+      this.noticeModalIsError = false;
       this.error = "";
       try {
         await this.saveConfig({ throwOnError: true, silent: true });
         const response = await this.fetchJson("/api/hdhive/checkin-now", { method: "POST" });
-        const notice = String(
-          this._hdhiveCheckinNoticeFromResponse(response) || response.message || "已完成请求。",
-        );
-        this.notice = notice;
-        if (notice.includes("HDHIVE_COOKIE")) {
+        this._applyHdhiveCheckinNoticeModal(response);
+        const isCookie = String(this.config.hdhive_checkin_method ?? "").trim() === "cookie";
+        const ck = String(response.data?.hdhive_cookie ?? "").trim();
+        const flat = String(this.notice || "").trim();
+        const envMsg = String(response.message || "").trim();
+        if (ck) {
+          this.config.hdhive_cookie = ck;
+          this.hdhiveCredentialsOpen = true;
+        }
+        if (
+          isCookie ||
+          ck ||
+          flat.includes("HDHIVE_COOKIE") ||
+          String(this.noticeModalBody || "").includes("HDHIVE_COOKIE") ||
+          envMsg.includes("HDHIVE_COOKIE")
+        ) {
           await this.fetchConfig();
+          if (ck && !String(this.config.hdhive_cookie || "").trim()) {
+            this.config.hdhive_cookie = ck;
+          }
         }
       } catch (err) {
         this.error = this.normalizeCaughtError(err);
@@ -1779,6 +1887,9 @@ export default {
     async triggerHdhiveCheckinTest() {
       this.hdhiveTestBusy = true;
       this.notice = "";
+      this.noticeModalTitle = "";
+      this.noticeModalBody = "";
+      this.noticeModalIsError = false;
       this.error = "";
       try {
         await this.saveConfig({ throwOnError: true, silent: true });
@@ -1793,12 +1904,26 @@ export default {
             is_gambler: Boolean(this.config.hdhive_checkin_gambler),
           }),
         });
-        const notice = String(
-          this._hdhiveCheckinNoticeFromResponse(response) || response.message || "测试请求已完成。",
-        );
-        this.notice = notice;
-        if (notice.includes("HDHIVE_COOKIE")) {
+        this._applyHdhiveCheckinNoticeModal(response);
+        const isCookie = String(this.config.hdhive_checkin_method ?? "").trim() === "cookie";
+        const ck = String(response.data?.hdhive_cookie ?? "").trim();
+        const flat = String(this.notice || "").trim();
+        const envMsg = String(response.message || "").trim();
+        if (ck) {
+          this.config.hdhive_cookie = ck;
+          this.hdhiveCredentialsOpen = true;
+        }
+        if (
+          isCookie ||
+          ck ||
+          flat.includes("HDHIVE_COOKIE") ||
+          String(this.noticeModalBody || "").includes("HDHIVE_COOKIE") ||
+          envMsg.includes("HDHIVE_COOKIE")
+        ) {
           await this.fetchConfig();
+          if (ck && !String(this.config.hdhive_cookie || "").trim()) {
+            this.config.hdhive_cookie = ck;
+          }
         }
       } catch (err) {
         this.error = this.normalizeCaughtError(err);

@@ -492,7 +492,11 @@ export default dashboard;
                   <span class="hdhive-privacy-credentials-title">敏感凭证（隐私）</span>
                 </div>
                 <template v-if="!hdhiveCredentialsOpen">
-                  <p class="panel-subtext">
+                  <p v-if="(config.hdhive_cookie || '').trim()" class="panel-subtext">
+                    当前已加载 Cookie（约 {{ (config.hdhive_cookie || '').length }} 字符）。隐藏区域不会阻止签到写回内存与
+                    .env；折叠时仅不显示输入框。点下方展开可查看、复制或编辑。
+                  </p>
+                  <p v-else class="panel-subtext">
                     凭证已遮盖；保存仍写入已保存值。需在本页修改时请展开。
                   </p>
                   <button type="button" class="btn btn-secondary btn-small" @click="hdhiveCredentialsOpen = true">
@@ -530,8 +534,9 @@ export default dashboard;
                       />
                     </label>
                     <p class="panel-subtext span-2">
-                      签到由服务端加载 <code>hdhive/hdhive_site_login_checkin.py</code> 完成登录与首页签到；可选在 .env 填写
-                      <code>HDHIVE_CHECKIN_NEXT_ACTION</code> 等覆盖内置解析。自动签到与测试/立即签到均只走账号密码登录（hdhive_site_login_checkin）。
+                      签到由服务端加载 <code>hdhive/hdhive_site_login_checkin.py</code>：先账号密码登录，再从登录态首页解析签到
+                      <code>Next-Action</code> 后 POST 签到。若解析失败或站点特殊，可在 .env 显式填写
+                      <code>HDHIVE_CHECKIN_NEXT_ACTION</code> 等覆盖。自动/测试/立即签到均走该流程。
                     </p>
                   </template>
                   <label class="span-2">
@@ -1383,7 +1388,7 @@ export default dashboard;
     <Teleport to="body">
       <Transition name="msg-modal">
         <div
-          v-if="notice || error"
+          v-if="notice || error || noticeModalTitle || noticeModalBody"
           class="msg-modal-layer"
           role="presentation"
         >
@@ -1394,7 +1399,7 @@ export default dashboard;
           />
           <div
             class="msg-modal"
-            :data-variant="error ? 'error' : 'success'"
+            :data-variant="error || noticeModalIsError ? 'error' : 'success'"
             role="alertdialog"
             aria-modal="true"
             aria-labelledby="msg-modal-title"
@@ -1409,13 +1414,15 @@ export default dashboard;
               ×
             </button>
             <div class="msg-modal-icon-wrap" aria-hidden="true">
-              <span class="msg-modal-icon" :data-kind="error ? 'error' : 'success'" />
+              <span class="msg-modal-icon" :data-kind="error || noticeModalIsError ? 'error' : 'success'" />
             </div>
             <h2 id="msg-modal-title" class="msg-modal-title">
-              {{ error ? '出错了' : '提示' }}
+              {{ error || noticeModalIsError ? '出错了' : noticeModalTitle || '提示' }}
             </h2>
-            <p id="msg-modal-desc" class="msg-modal-body">{{ error || notice }}</p>
-            <p v-if="notice && !error" class="msg-modal-hint">约 5 秒后自动关闭，也可点击遮罩或按 Esc。</p>
+            <p id="msg-modal-desc" class="msg-modal-body">{{ error || noticeModalBody || notice }}</p>
+            <p v-if="(notice || noticeModalTitle || noticeModalBody) && !error && !noticeModalIsError" class="msg-modal-hint">
+              约 5 秒后自动关闭，也可点击遮罩或按 Esc。
+            </p>
             <button type="button" class="msg-modal-primary" @click="dismissMessage">
               知道了
             </button>

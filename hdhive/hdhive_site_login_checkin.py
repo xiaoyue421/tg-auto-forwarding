@@ -202,6 +202,10 @@ def _urlopen_read_requests(opener: urllib.request.OpenerDirector, req: urllib.re
 
     HDHive 脚本**不再**调用 ``opener.open().read()``，避免 ``urllib.response.addbase`` /
     ``TemporaryFileWrapper`` 在部分环境下抛出 ``NoneType`` / ``__dict__`` 等 ``AttributeError``。
+
+    必须使用 **Session + 同一 CookieJar**：单次 ``requests.request(..., cookies=CookieJar)`` 在跟随重定向时
+    不会把各跳 ``Set-Cookie`` 写回 ``http.cookiejar.CookieJar``，导致登录后 ``cookie_header_from_opener`` 为空、
+    无法写回 ``HDHIVE_COOKIE``。
     """
     try:
         import requests
@@ -214,13 +218,18 @@ def _urlopen_read_requests(opener: urllib.request.OpenerDirector, req: urllib.re
     method = req.get_method()
     headers = dict(req.header_items())
     body = req.data
-    proxies = _opener_requests_proxies(opener)
+    proxies = _opener_requests_proxies(opener) or {}
     cj = _opener_cookiejar(opener)
-    kw: dict = {"timeout": timeout, "proxies": proxies}
-    if cj is not None:
-        kw["cookies"] = cj
+    sess_attr = "_hdhive_site_login_requests_session"
+    sess = getattr(opener, sess_attr, None)
+    if sess is None:
+        sess = requests.Session()
+        sess.proxies = proxies
+        if cj is not None:
+            sess.cookies = cj
+        setattr(opener, sess_attr, sess)
     try:
-        r = requests.request(method, url, headers=headers, data=body, **kw)
+        r = sess.request(method, url, headers=headers, data=body, timeout=timeout)
     except Exception as exc:
         raise OSError(f"requests 请求失败：{exc}") from exc
     ce = r.headers.get("Content-Encoding", "") or ""
@@ -302,7 +311,8 @@ def cookie_header_from_opener(opener: urllib.request.OpenerDirector) -> str:
                 if c is None:
                     continue
                 dom = (getattr(c, "domain", None) or "").lstrip(".").lower()
-                if not dom.endswith("hdhive.com"):
+                # 本 opener 仅用于 hdhive.com；空 domain 常见于未写 Domain 的 Set-Cookie，仍应写入会话串。
+                if dom and not dom.endswith("hdhive.com"):
                     continue
                 name = getattr(c, "name", None)
                 if not name:
@@ -476,11 +486,116 @@ def candidate_bodies(email: str, password: str, redirect: str) -> list[tuple[str
 
 
 def server_action_body_indicates_failure(text: str) -> bool:
-    if '"success":false' in text:
+    if re.search(r'"success"\s*:\s*false', text or ""):
         return True
     if '"error"' in text and "LoginRequest" in text:
         return True
     return False
+
+
+def _json_loads_rsc_payload(payload: str) -> object | None:
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
+def _iter_digit_prefixed_json_dicts(text: str):
+    """解析 RSC flight 里 ``数字:`` 前缀行；JSON 跨多行时合并后再 ``json.loads``（与 tg_forwarder.hdhive_checkin 一致）。"""
+    lines = (text or "").splitlines()
+    i = 0
+    n = len(lines)
+    digit_line = re.compile(r"^\s*\d+\s*:")
+    while i < n:
+        stripped = lines[i].strip()
+        if ":" not in stripped:
+            i += 1
+            continue
+        colon = stripped.find(":")
+        prefix = stripped[:colon].strip()
+        if not prefix.isdigit():
+            i += 1
+            continue
+        payload = stripped[colon + 1 :].lstrip()
+        merged = payload
+        j = i
+        data = _json_loads_rsc_payload(merged)
+        while data is None and j + 1 < n:
+            nxt = lines[j + 1]
+            if digit_line.match(nxt.strip()):
+                break
+            merged += "\n" + nxt
+            j += 1
+            data = _json_loads_rsc_payload(merged)
+            if len(merged) > 400_000:
+                break
+        next_i = j + 1 if j > i else i + 1
+        if isinstance(data, dict):
+            yield data
+        i = next_i
+
+
+def _success_field_is_false(val: object) -> bool:
+    """站点 JSON 里 ``success`` 多为布尔 ``false``；偶见字符串或缺省与其它字段混排。"""
+    if val is False:
+        return True
+    if isinstance(val, str) and val.strip().lower() in {"false", "0", "no"}:
+        return True
+    if isinstance(val, (int, float)) and val == 0:
+        return True
+    return False
+
+
+def _flight_error_dict_candidates(data: dict) -> list[dict]:
+    """与 ``tg_forwarder.hdhive_checkin.parse_hdhive_site_rsc_message`` 一致：顶层 ``error`` 及
+    ``result`` / ``data`` / ``actionResult`` 内的嵌套 ``error``。"""
+    out: list[dict] = []
+    err = data.get("error")
+    if isinstance(err, dict):
+        out.append(err)
+    for key in ("result", "data", "actionResult"):
+        inner = data.get(key)
+        if isinstance(inner, dict):
+            err2 = inner.get("error")
+            if isinstance(err2, dict):
+                out.append(err2)
+    return out
+
+
+def _pick_json_string_field_near(blob: str, field: str) -> str:
+    m = re.search(rf'"{re.escape(field)}"\s*:\s*"((?:[^"\\\\]|\\\\.)*)"', blob)
+    if not m:
+        return ""
+    inner = m.group(1)
+    try:
+        return json.loads(f'"{inner}"')
+    except json.JSONDecodeError:
+        return inner.replace(r"\"", '"').replace(r"\\", "\\")
+
+
+def rsc_checkin_error_success_false(text: str) -> tuple[bool, str, str]:
+    """若 flight 中出现 ``success: false`` 的业务错误块，返回 (True, message, description)。"""
+    blob = text or ""
+    for data in _iter_digit_prefixed_json_dicts(blob):
+        if not isinstance(data, dict):
+            continue
+        for err in _flight_error_dict_candidates(data):
+            if not _success_field_is_false(err.get("success")):
+                continue
+            msg = str(err.get("message") or "").strip()
+            desc = str(err.get("description") or "").strip()
+            return True, msg, desc
+    rel = re.search(r'"success"\s*:\s*false', blob, flags=re.I)
+    if not rel:
+        return False, "", ""
+    start = max(0, rel.start() - 600)
+    end = min(len(blob), rel.end() + 2000)
+    window = blob[start:end]
+    msg = _pick_json_string_field_near(window, "message")
+    desc = _pick_json_string_field_near(window, "description")
+    if msg or desc:
+        return True, msg, desc
+    return False, "", ""
 
 
 def checkin_failure_is_benign_already_done(text: str) -> bool:
@@ -491,21 +606,11 @@ def checkin_failure_is_benign_already_done(text: str) -> bool:
 
 
 def rsc_first_business_line(text: str) -> str:
-    for line in text.splitlines():
-        s = line.strip()
-        if not s or ":" not in s:
-            continue
-        head, rest = s.split(":", 1)
-        if not head.isdigit():
-            continue
-        try:
-            data = json.loads(rest.strip())
-        except json.JSONDecodeError:
-            continue
+    """取首条可读业务文案（兼容多行 JSON 块、嵌套 error）。"""
+    for data in _iter_digit_prefixed_json_dicts(text):
         if not isinstance(data, dict):
             continue
-        err = data.get("error")
-        if isinstance(err, dict):
+        for err in _flight_error_dict_candidates(data):
             desc = str(err.get("description") or "").strip()
             msg = str(err.get("message") or "").strip()
             if desc:
@@ -533,6 +638,12 @@ def print_cookie_summary(opener: urllib.request.OpenerDirector) -> None:
             val = getattr(cookie, "value", "") or ""
             masked = (val[:8] + "…" + val[-6:]) if len(val) > 20 else "***"
             print(f"  {getattr(cookie, 'name', '?')}: {masked} domain={getattr(cookie, 'domain', '')} path={getattr(cookie, 'path', '')}")
+    try:
+        header = cookie_header_from_opener(opener)
+    except Exception:
+        header = ""
+    print("\n--- Cookie 请求头（分号+空格分隔，与写入 HDHIVE_COOKIE 格式一致）---")
+    print(header if header else "（无）")
 
 
 def run_site_login_checkin(
@@ -548,7 +659,12 @@ def run_site_login_checkin(
     checkin_next_action: str = "",
     checkin_router_tree: str = "",
 ) -> SiteLoginCheckinResult:
-    """使用已配置代理与 CookieJar 的 opener 执行登录（及可选签到）。"""
+    """使用已配置代理与 CookieJar 的 opener 执行登录（及可选签到）。
+
+    ``checkin_next_action`` / ``checkin_router_tree`` 为空时：在**登录成功**后拉取首页，再从 HTML/分块 JS
+    解析签到用的 ``Next-Action``；树为空则使用本模块内置的默认 ``Next-Router-State-Tree``。
+    非空字符串表示调用方（如 .env 显式覆盖）提供的值，将**优先**于解析结果。
+    """
     try:
         ck = cookie_header_from_opener(opener)
     except Exception:
@@ -596,6 +712,7 @@ def run_site_login_checkin(
             return SiteLoginCheckinResult(0, 200, text[:8000], "登录成功", "", ck_ok)
 
         home_html = fetch_home_page(opener)
+        # 签到元数据在登录态首页/JS 中；调用方未覆盖时才解析，避免用陈旧内置哈希跳过 discover
         ck_na = (checkin_next_action or "").strip()
         if not ck_na:
             ck_na = discover_checkin_next_action(opener, home_html) or ""
@@ -612,11 +729,18 @@ def run_site_login_checkin(
         biz = rsc_first_business_line(ck_text)
         if st >= 400:
             return SiteLoginCheckinResult(1, st, ck_text[:8000], "签到失败", biz or f"HTTP {st}", ck_final)
-        if '"success":false' in ck_text:
+        err_hit, emsg, edesc = rsc_checkin_error_success_false(ck_text)
+        if err_hit:
+            em = (emsg or "签到失败").strip()
+            ed = (edesc or "").strip()
             if checkin_failure_is_benign_already_done(ck_text):
-                return SiteLoginCheckinResult(0, 200, ck_text[:8000], biz or "今日已签到", "", ck_final)
-            return SiteLoginCheckinResult(1, 400, ck_text[:8000], "签到失败", biz, ck_final)
-        return SiteLoginCheckinResult(0, 200, ck_text[:8000], "签到完成", biz, ck_final)
+                # 业务上视为「今日已处理」：仍用站点返回的 message/description，避免误报「签到完成」
+                return SiteLoginCheckinResult(0, 200, ck_text[:8000], em, ed, ck_final)
+            return SiteLoginCheckinResult(1, 400, ck_text[:8000], em, ed or biz or "", ck_final)
+        # message → 弹窗标题，description → 弹窗正文；无 RSC 附句时正文默认「签到成功」
+        return SiteLoginCheckinResult(
+            0, 200, ck_text[:8000], "签到完成", (biz or "").strip() or "签到成功", ck_final
+        )
 
     hint = rsc_first_business_line(last_text) or last_text[:500]
     return SiteLoginCheckinResult(
