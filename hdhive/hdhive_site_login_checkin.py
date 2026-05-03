@@ -26,6 +26,18 @@ BASE_URL = "https://hdhive.com"
 LOGIN_URL = f"{BASE_URL}/login"
 CHECKIN_URL = f"{BASE_URL}/"
 
+# 存入 ``SiteLoginCheckinResult.raw`` 的长度上限。过小会截断含 ``1:{"error":{"success":false`` 的 flight，
+# 导致接口 ``data.body`` 与解析误判（与 CLI 全文不一致）。
+_MAX_STORED_RESPONSE_CHARS = 524_288
+
+
+def clip_stored_response_body(s: str) -> str:
+    t = s or ""
+    if len(t) <= _MAX_STORED_RESPONSE_CHARS:
+        return t
+    return t[:_MAX_STORED_RESPONSE_CHARS]
+
+
 DEFAULT_CHECKIN_NEXT_ACTION = "40f6fa81b95f6ab53478231d5b36e8ac9b8722d28d"
 DEFAULT_CHECKIN_NEXT_ROUTER_STATE_TREE = (
     "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
@@ -106,7 +118,12 @@ UA = (
 
 @dataclass(frozen=True)
 class SiteLoginCheckinResult:
-    """供宿主映射为 HTTP 状态与写回 Cookie。"""
+    """供宿主映射为 HTTP 状态与写回 Cookie。
+
+    ``message`` / ``description`` 与控制台 Web 一致：宿主将二者映射为
+    ``data.checkin_message`` / ``data.checkin_description``（弹窗标题与副文），
+    顶层 ``ApiResponse.message`` 多为 ``message`` 与 ``description`` 空格拼接的一行文案。
+    """
 
     exit_code: int
     http_status: int
@@ -254,6 +271,51 @@ def build_opener(proxy_url: str | None = None) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers)
 
 
+def _first_dotenv_path() -> Path | None:
+    """与 ``build_opener_from_dashboard_env`` 相同的候选顺序：当前工作目录优先，再沿脚本目录向上查找。"""
+    script_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = [Path.cwd() / ".env"]
+    for i in range(0, 8):
+        try:
+            candidates.append(script_dir.parents[i] / ".env")
+        except IndexError:
+            break
+    seen: set[str] = set()
+    for p in candidates:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key in seen or not p.is_file():
+            continue
+        seen.add(key)
+        return p
+    return None
+
+
+def _merge_dotenv_into_os_environ() -> None:
+    """将首个命中的 ``.env`` 写入 ``os.environ``（不覆盖调用方已设置的键），便于直接 ``python hdhive/...`` 而无需先 ``export``。"""
+    path = _first_dotenv_path()
+    if not path:
+        return
+    values: dict[str, str] = {}
+    try:
+        from tg_forwarder.env_utils import read_env_file
+
+        values = read_env_file(path)
+    except ImportError:
+        try:
+            from dotenv import dotenv_values
+
+            raw = dotenv_values(path)
+            values = {str(k): str(v) for k, v in raw.items() if k is not None and v is not None}
+        except ImportError:
+            return
+    for k, v in values.items():
+        if k not in os.environ:
+            os.environ[k] = v
+
+
 def build_opener_from_dashboard_env() -> urllib.request.OpenerDirector:
     """与控制台 / ``tg_forwarder.hdhive_checkin`` 一致：读 ``.env`` 中 ``TG_PROXY_*``、``HDHIVE_CHECKIN_*`` 等并构建 opener。
 
@@ -269,24 +331,9 @@ def build_opener_from_dashboard_env() -> urllib.request.OpenerDirector:
         ).strip()
         return build_opener(pu or None)
 
-    script_dir = Path(__file__).resolve().parent
-    candidates: list[Path] = [Path.cwd() / ".env"]
-    for i in range(0, 8):
-        try:
-            candidates.append(script_dir.parents[i] / ".env")
-        except IndexError:
-            break
-
-    seen: set[str] = set()
-    for p in candidates:
-        try:
-            key = str(p.resolve())
-        except OSError:
-            key = str(p)
-        if key in seen or not p.is_file():
-            continue
-        seen.add(key)
-        values = read_env_file(p)
+    env_path = _first_dotenv_path()
+    if env_path is not None:
+        values = read_env_file(env_path)
         proxy, err = resolve_hdhive_proxy(values)
         if err:
             print(f"警告（HDHive 代理）：{err}", file=sys.stderr)
@@ -532,6 +579,11 @@ def _iter_digit_prefixed_json_dicts(text: str):
         next_i = j + 1 if j > i else i + 1
         if isinstance(data, dict):
             yield data
+        elif merged and re.search(r'"success"\s*:\s*false', merged, flags=re.I):
+            em = _pick_json_string_field_near(merged, "message")
+            ed = _pick_json_string_field_near(merged, "description")
+            if em or ed:
+                yield {"error": {"success": False, "message": em, "description": ed}}
         i = next_i
 
 
@@ -598,11 +650,67 @@ def rsc_checkin_error_success_false(text: str) -> tuple[bool, str, str]:
     return False, "", ""
 
 
+def _checkin_response_suggests_stale_or_wrong_next_action(blob: str) -> bool:
+    """显式传入的 ``Next-Action`` 过期或错误时，站点常仍 HTTP 200 但正文为登录页 / 空壳 flight（无 ``1:{"error"`` 业务行）。
+
+    与「未设 ``HDHIVE_CHECKIN_*``、仅靠首页解析」的 CLI 行为对齐：命中本函数时应丢弃覆盖哈希并 ``discover`` 后重试。
+    """
+    s = blob or ""
+    if not s.strip():
+        return False
+    if rsc_checkin_error_success_false(s)[0]:
+        return False
+    if re.search(r'1:\s*\{\s*"error"\s*:\s*\{', s):
+        return False
+    if "登录您的账号" in s and ("Login Now" in s or "第三方注册登录" in s):
+        return True
+    if "登录 - HDHive" in s and "(auth)" in s:
+        return True
+    head = s[:12_000].lstrip()
+    if head.startswith('1:"$Sreact.fragment"') and '{"error"' not in s[:220_000]:
+        return True
+    return False
+
+
 def checkin_failure_is_benign_already_done(text: str) -> bool:
     biz = rsc_first_business_line(text)
     blob = biz + text
     needles = ("已经签到", "签到过了", "明天再来", "重复签到", "无需重复")
     return any(n in blob for n in needles)
+
+
+def rsc_plain_message_description(text: str) -> tuple[str, str]:
+    """从 flight 中取非 ``error.success:false`` 的 ``message`` / ``description``（HTTP 成功且无业务错误块时）。"""
+    for data in _iter_digit_prefixed_json_dicts(text or ""):
+        if not isinstance(data, dict):
+            continue
+        skip = False
+        for err in _flight_error_dict_candidates(data):
+            if _success_field_is_false(err.get("success")):
+                skip = True
+                break
+        if skip:
+            continue
+        msg = str(data.get("message") or "").strip()
+        desc = str(data.get("description") or "").strip()
+        if msg or desc:
+            return msg, desc
+        for key in ("result", "data", "actionResult"):
+            inner = data.get(key)
+            if not isinstance(inner, dict):
+                continue
+            skip2 = False
+            for err in _flight_error_dict_candidates(inner):
+                if _success_field_is_false(err.get("success")):
+                    skip2 = True
+                    break
+            if skip2:
+                continue
+            msg = str(inner.get("message") or "").strip()
+            desc = str(inner.get("description") or "").strip()
+            if msg or desc:
+                return msg, desc
+    return "", ""
 
 
 def rsc_first_business_line(text: str) -> str:
@@ -663,7 +771,8 @@ def run_site_login_checkin(
 
     ``checkin_next_action`` / ``checkin_router_tree`` 为空时：在**登录成功**后拉取首页，再从 HTML/分块 JS
     解析签到用的 ``Next-Action``；树为空则使用本模块内置的默认 ``Next-Router-State-Tree``。
-    非空字符串表示调用方（如 .env 显式覆盖）提供的值，将**优先**于解析结果。
+    非空字符串表示调用方（如 .env 显式覆盖）提供的值，将**优先**于解析结果；若该哈希已过期导致正文为登录页 /
+    ``fragment`` 壳（无业务 ``error`` 行），在 HTTP 200 下会**按首页重新 discover 并重试一次**签到 POST。
     """
     try:
         ck = cookie_header_from_opener(opener)
@@ -709,11 +818,13 @@ def run_site_login_checkin(
 
         ck_ok = cookie_header_from_opener(opener)
         if not do_checkin:
-            return SiteLoginCheckinResult(0, 200, text[:8000], "登录成功", "", ck_ok)
+            return SiteLoginCheckinResult(0, 200, clip_stored_response_body(text), "登录成功", "", ck_ok)
 
         home_html = fetch_home_page(opener)
-        # 签到元数据在登录态首页/JS 中；调用方未覆盖时才解析，避免用陈旧内置哈希跳过 discover
-        ck_na = (checkin_next_action or "").strip()
+        # 签到元数据在登录态首页/JS 中；.env 显式 HDHIVE_CHECKIN_NEXT_ACTION 过期时首包常为登录页 RSC，
+        # 与「命令行不传覆盖、仅靠 discover」的表现不一致，故命中壳响应时用首页哈希重试一次。
+        ck_na_explicit = (checkin_next_action or "").strip()
+        ck_na = ck_na_explicit
         if not ck_na:
             ck_na = discover_checkin_next_action(opener, home_html) or ""
         if not ck_na:
@@ -725,28 +836,52 @@ def run_site_login_checkin(
             router_tree=ck_tree,
             is_gambler=is_gambler,
         )
+        # 不论 .env 是否显式写死签到哈希：HTTP 200 但正文为登录页 / 空壳时都应尝试用首页重新 discover（仅靠默认哈希时与 CLI 不一致）
+        if st == 200 and _checkin_response_suggests_stale_or_wrong_next_action(ck_text):
+            ck_na2 = discover_checkin_next_action(opener, home_html) or ""
+            if ck_na2 and ck_na2 != ck_na:
+                st, ck_text = post_checkin_server_action(
+                    opener,
+                    next_action=ck_na2,
+                    router_tree=ck_tree,
+                    is_gambler=is_gambler,
+                )
         ck_final = cookie_header_from_opener(opener)
         biz = rsc_first_business_line(ck_text)
         if st >= 400:
-            return SiteLoginCheckinResult(1, st, ck_text[:8000], "签到失败", biz or f"HTTP {st}", ck_final)
+            return SiteLoginCheckinResult(1, st, clip_stored_response_body(ck_text), "签到失败", biz or f"HTTP {st}", ck_final)
         err_hit, emsg, edesc = rsc_checkin_error_success_false(ck_text)
         if err_hit:
             em = (emsg or "签到失败").strip()
             ed = (edesc or "").strip()
             if checkin_failure_is_benign_already_done(ck_text):
                 # 业务上视为「今日已处理」：仍用站点返回的 message/description，避免误报「签到完成」
-                return SiteLoginCheckinResult(0, 200, ck_text[:8000], em, ed, ck_final)
-            return SiteLoginCheckinResult(1, 400, ck_text[:8000], em, ed or biz or "", ck_final)
-        # message → 弹窗标题，description → 弹窗正文；无 RSC 附句时正文默认「签到成功」
-        return SiteLoginCheckinResult(
-            0, 200, ck_text[:8000], "签到完成", (biz or "").strip() or "签到成功", ck_final
-        )
+                return SiteLoginCheckinResult(0, 200, clip_stored_response_body(ck_text), em, ed, ck_final)
+            return SiteLoginCheckinResult(1, 400, clip_stored_response_body(ck_text), em, ed or biz or "", ck_final)
+        # Web/CLI 展示用：优先站点 JSON 的 message + description，不写死「签到成功」
+        sm, sd = rsc_plain_message_description(ck_text)
+        if sm or sd:
+            return SiteLoginCheckinResult(0, 200, clip_stored_response_body(ck_text), sm, sd, ck_final)
+        biz_line = (biz or "").strip()
+        if biz_line:
+            return SiteLoginCheckinResult(0, 200, clip_stored_response_body(ck_text), "", biz_line, ck_final)
+        # 未解析到业务 JSON 时：若正文仍是登录页 / RSC 空壳，不得回落为「签到完成」（常见于仅用过期默认哈希、discover 未命中）
+        if st == 200 and _checkin_response_suggests_stale_or_wrong_next_action(ck_text):
+            return SiteLoginCheckinResult(
+                1,
+                400,
+                clip_stored_response_body(ck_text),
+                "签到失败",
+                "站点返回疑似登录页或未匹配的签到动作，请检查账号密码或在 .env 中设置由首页解析得到的 HDHIVE_CHECKIN_NEXT_ACTION。",
+                ck_final,
+            )
+        return SiteLoginCheckinResult(0, 200, clip_stored_response_body(ck_text), "签到完成", "", ck_final)
 
     hint = rsc_first_business_line(last_text) or last_text[:500]
     return SiteLoginCheckinResult(
         1,
         last_status if last_status > 0 else 401,
-        last_text[:8000],
+        clip_stored_response_body(last_text),
         "登录失败",
         hint,
         cookie_header_from_opener(opener),
@@ -764,18 +899,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gambler", dest="is_gambler", action="store_true")
     parser.add_argument("--checkin-next-action", default="", help="签到 Next-Action")
     parser.add_argument("--checkin-next-router-state-tree", default="", help="签到 Next-Router-State-Tree")
+    parser.add_argument(
+        "--emit-json-result",
+        action="store_true",
+        help="仅向 stdout 输出一行 JSON（exit_code/http_status/message/description/cookie_header/raw），"
+        "供控制台子进程解析；不打印 GET / 响应摘录 / Cookie 人类可读块。",
+    )
     parser.set_defaults(checkin=True, is_gambler=False)
     args = parser.parse_args(argv)
+
+    _merge_dotenv_into_os_environ()
 
     email = (args.email or "").strip() or os.environ.get("HDHIVE_LOGIN_USERNAME", "").strip()
     email = email or os.environ.get("HDHIVE_LOGIN_EMAIL", "").strip()
     password = (args.password or "").strip() or os.environ.get("HDHIVE_LOGIN_PASSWORD", "").strip()
     if not email or not password:
-        print("错误：请提供 --username / --password 或环境变量 HDHIVE_LOGIN_USERNAME（或 HDHIVE_LOGIN_EMAIL）与 HDHIVE_LOGIN_PASSWORD。", file=sys.stderr)
+        print(
+            "错误：请提供 --username / --password，或在当前目录/项目根目录的 .env 中配置 "
+            "HDHIVE_LOGIN_USERNAME（或 HDHIVE_LOGIN_EMAIL）与 HDHIVE_LOGIN_PASSWORD（亦可先 export 到环境变量）。",
+            file=sys.stderr,
+        )
         return 2
 
     opener = build_opener_from_dashboard_env()
-    print("GET", LOGIN_URL, "…")
+    if not args.emit_json_result:
+        print("GET", LOGIN_URL, "…")
     res = run_site_login_checkin(
         opener,
         username=email,
@@ -790,6 +938,18 @@ def main(argv: list[str] | None = None) -> int:
             args.checkin_next_router_state_tree or os.environ.get("HDHIVE_CHECKIN_NEXT_ROUTER_STATE_TREE", "")
         ).strip(),
     )
+    if args.emit_json_result:
+        payload = {
+            "exit_code": int(res.exit_code),
+            "http_status": int(res.http_status),
+            "message": res.message or "",
+            "description": res.description or "",
+            "cookie_header": res.cookie_header or "",
+            "raw": clip_stored_response_body(res.raw or ""),
+        }
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return int(res.exit_code)
+    # CLI 一行摘要：与 Web「测试/立即签到」弹窗同源字段（message + 可选空格 + description）。
     print(res.message, res.description, sep=" " if res.description else "")
     if res.raw:
         print("\n--- 响应摘录 ---\n", res.raw[:2000])

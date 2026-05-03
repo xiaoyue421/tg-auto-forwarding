@@ -1,7 +1,0 @@
-segno>=1.6.0,<2.0.0
-Telethon>=1.42.0,<2.0.0
-PyYAML>=6.0.2,<7.0.0
-python-dotenv>=1.0.1,<2.0.0
-python-socks[asyncio]>=2.5.3,<3.0.0
-fastapi>=0.115.0,<1.0.0
-uvicorn>=0.32.0,<1.0.0

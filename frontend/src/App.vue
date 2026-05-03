@@ -1417,7 +1417,10 @@ export default dashboard;
               <span class="msg-modal-icon" :data-kind="error || noticeModalIsError ? 'error' : 'success'" />
             </div>
             <h2 id="msg-modal-title" class="msg-modal-title">
-              {{ error || noticeModalIsError ? '出错了' : noticeModalTitle || '提示' }}
+              {{
+                error ||
+                (noticeModalIsError ? noticeModalTitle || '出错了' : noticeModalTitle || '提示')
+              }}
             </h2>
             <p id="msg-modal-desc" class="msg-modal-body">{{ error || noticeModalBody || notice }}</p>
             <p v-if="(notice || noticeModalTitle || noticeModalBody) && !error && !noticeModalIsError" class="msg-modal-hint">

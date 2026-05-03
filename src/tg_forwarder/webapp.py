@@ -447,6 +447,32 @@ def _maybe_cors_middleware(app: FastAPI, config_path: Path) -> None:
     )
 
 
+def _regex_extract_rsc_message_description(blob: str) -> tuple[str, str]:
+    """不依赖 ``N:`` 行结构，在整段 RSC 正文中尝试抠 ``message`` / ``description``。"""
+    if not blob:
+        return "", ""
+
+    def _unquote_json_string(inner: str) -> str:
+        try:
+            return str(json.loads(f'"{inner}"'))
+        except json.JSONDecodeError:
+            return inner.replace(r"\"", '"').replace(r"\\", "\\")
+
+    m = re.search(
+        r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"description"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        blob,
+    )
+    if m:
+        return _unquote_json_string(m.group(1)).strip(), _unquote_json_string(m.group(2)).strip()
+    m2 = re.search(
+        r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"message"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        blob,
+    )
+    if m2:
+        return _unquote_json_string(m2.group(2)).strip(), _unquote_json_string(m2.group(1)).strip()
+    return "", ""
+
+
 def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     resolved_config_path = Path(config_path).resolve()
     log_handler = build_log_handler()
@@ -1200,6 +1226,61 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=translate_error(str(exc))) from exc
 
+    def _enrich_hdhive_cookie_checkin_msg_desc_from_raw(raw: str, msg: str, desc: str) -> tuple[str, str]:
+        """网页账号签到：泛化「签到完成」、description 为空或整段为 RSC 时，强制从正文解析 message/description。"""
+        from tg_forwarder.hdhive_checkin import (
+            _looks_like_nextjs_rsc_flight,
+            _parse_hdhive_site_rsc_message_loose_window,
+            parse_hdhive_site_rsc_message,
+        )
+
+        blob = raw or ""
+        m = (msg or "").strip()
+        d = (desc or "").strip()
+        wrong_generic = m == "签到完成" and (not d or d == "签到成功")
+        if (m and d) and not wrong_generic:
+            return m, d
+        if not blob:
+            return m, d
+
+        rsc_like = _looks_like_nextjs_rsc_flight(blob)
+        has_sf = bool(re.search(r'"success"\s*:\s*false', blob))
+        should_try = (
+            wrong_generic
+            or (m == "签到完成" and not d)
+            or has_sf
+            or (rsc_like and (wrong_generic or not d or not m))
+        )
+        if not should_try:
+            return m, d
+
+        pm, pd = parse_hdhive_site_rsc_message(blob)
+        if not (pm or pd):
+            pm, pd = _parse_hdhive_site_rsc_message_loose_window(blob)
+        if not (pm or pd):
+            pm, pd = _regex_extract_rsc_message_description(blob)
+        if not (pm or pd):
+            msg_iter = list(
+                re.finditer(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', blob),
+            )
+            desc_iter = list(
+                re.finditer(r'"description"\s*:\s*"((?:[^"\\]|\\.)*)"', blob),
+            )
+
+            def _uq_field(mo: re.Match) -> str:
+                inner = mo.group(1)
+                try:
+                    return str(json.loads(f'"{inner}"')).strip()
+                except json.JSONDecodeError:
+                    return inner.replace(r"\"", '"').replace(r"\\", "\\").strip()
+
+            if msg_iter or desc_iter:
+                pm = _uq_field(msg_iter[-1]) if msg_iter else ""
+                pd = _uq_field(desc_iter[-1]) if desc_iter else ""
+        if pm or pd:
+            return (pm or m).strip(), (pd or d).strip()
+        return m, d
+
     def _hdhive_checkin_api_response(
         status: int,
         raw: str,
@@ -1210,12 +1291,16 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         hdhive_cookie: str | None = None,
         include_hdhive_cookie_field: bool = False,
     ) -> ApiResponse:
-        safe_title = (title or "").strip() or (f"HTTP {status}" if status > 0 else "请求结束")
+        t = (title or "").strip()
+        d = (desc or "").strip()
+        safe_title = t or (f"HTTP {status}" if status > 0 else "请求结束")
+        # 顶层 message 与 CLI 一行一致，仅读 message 的旧前端也能看到完整语义
+        combined_message = f"{t} {d}".strip() or safe_title
         data: dict = {
             "http_status": status,
             "body": raw,
-            "checkin_message": title,
-            "checkin_description": desc,
+            "checkin_message": t,
+            "checkin_description": d,
             "checkin_ok": bool(checkin_ok),
         }
         ck = (hdhive_cookie or "").strip()
@@ -1224,7 +1309,7 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             data["hdhive_cookie"] = ck
         elif ck:
             data["hdhive_cookie"] = ck
-        return ApiResponse(message=safe_title, data=data)
+        return ApiResponse(message=combined_message, data=data)
 
     @app.post("/api/hdhive/checkin-test")
     def hdhive_checkin_test(request: Request, payload: HdhiveCheckinTestPayload) -> ApiResponse:
@@ -1260,14 +1345,17 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
         proxy, proxy_err = resolve_hdhive_proxy(values)
         if proxy_err:
             raise HTTPException(status_code=400, detail=translate_error(proxy_err))
+        hdhive_env = env_for_run if method == "cookie" else values
         status, raw, msg, desc, resp_hdrs, new_ck, checkin_ok = run_hdhive_checkin(
             method=method,
             api_key=api_key,
             cookie_header="",
             is_gambler=bool(payload.is_gambler),
             proxy=proxy,
-            hdhive_env=env_for_run if method == "cookie" else values,
+            hdhive_env=hdhive_env,
         )
+        if method == "cookie":
+            msg, desc = _enrich_hdhive_cookie_checkin_msg_desc_from_raw(raw, msg, desc)
         if status < 0:
             human = _hdhive_checkin_negative_status_detail(status, raw, msg, desc)
             log = logging.getLogger("tg_forwarder.hdhive")
@@ -1335,6 +1423,8 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             proxy=proxy,
             hdhive_env=values,
         )
+        if method == "cookie":
+            msg, desc = _enrich_hdhive_cookie_checkin_msg_desc_from_raw(raw, msg, desc)
         if status < 0:
             human = _hdhive_checkin_negative_status_detail(status, raw, msg, desc)
             log = logging.getLogger("tg_forwarder.hdhive")

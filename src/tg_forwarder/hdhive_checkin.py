@@ -1,16 +1,22 @@
-"""HDHive (https://hdhive.com/) check-in: Premium API Key 或网页账号密码（``hdhive_site_login_checkin``）。"""
+"""HDHive (https://hdhive.com/) check-in: Premium API Key 或网页账号密码。
+
+- **API Key 模式**（``HDHIVE_CHECKIN_METHOD`` 非 cookie）：直连 ``/api/open/checkin``。
+- **Cookie / 网页账号**：Web、定时与 ``run_hdhive_checkin`` 均通过子进程执行
+  ``hdhive/hdhive_site_login_checkin.py``（``run_cookie_checkin_via_site_login_script``），与 CLI 脚本一致。
+- **命令行** ``python -m tg_forwarder.hdhive_checkin`` 在 cookie 时同样走该子进程。
+"""
 
 from __future__ import annotations
 
 import asyncio
 import gzip
-import importlib.util
 import json
-import os
 import logging
+import os
 import random
 import re
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -45,6 +51,10 @@ def cookie_checkin_next_meta_from_env(values: dict[str, str] | None) -> tuple[st
     若解析仍失败，脚本内部再回退到 ``hdhive_site_login_checkin`` 内置常量。
 
     仍兼容旧键名 ``HDHIVE_NEXT_ACTION`` / ``HDHIVE_NEXT_ROUTER_STATE_TREE``。
+
+    注意：若此处填写的哈希已过期，首包可能像「登录页 RSC」；``run_site_login_checkin`` 会检测并重试 discover，
+    与直接运行 ``python hdhive/hdhive_site_login_checkin.py``（通常不传覆盖）对齐。长期仍建议删掉过时
+    ``HDHIVE_CHECKIN_NEXT_ACTION`` / ``HDHIVE_CHECKIN_NEXT_ROUTER_STATE_TREE``。
     """
     if not values:
         return "", ""
@@ -190,44 +200,6 @@ def _hdhive_site_login_script_path() -> Path:
     if len(here.parents) > 2:
         return here.parents[2] / rel
     return cwd_cand
-
-
-_site_login_module_cache: tuple[str, float, object] | None = None
-
-
-def _load_hdhive_site_login_module():
-    """按脚本路径 + mtime 缓存；文件更新后自动重新加载，避免长驻进程一直用旧版 hdhive 脚本。"""
-    global _site_login_module_cache
-    if os.environ.get("HDHIVE_SITE_LOGIN_SCRIPT_NOCACHE", "").strip().lower() in ("1", "true", "yes", "on"):
-        _site_login_module_cache = None
-    path = _hdhive_site_login_script_path()
-    if not path.is_file():
-        return None
-    try:
-        key = str(path.resolve())
-        mtime = path.stat().st_mtime
-    except OSError:
-        key = str(path)
-        mtime = -1.0
-    if _site_login_module_cache is not None:
-        ck, mt, mod = _site_login_module_cache
-        if ck == key and mt == mtime:
-            return mod
-    spec = importlib.util.spec_from_file_location("hdhive_site_login_checkin", path)
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    # 必须在 exec_module 之前注册：Python 3.12 的 @dataclass 会查 sys.modules[cls.__module__]，
-    # 未注册时为 None，触发 AttributeError: 'NoneType' object has no attribute '__dict__'。
-    mod_name = spec.name or "hdhive_site_login_checkin"
-    sys.modules[mod_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except BaseException:
-        sys.modules.pop(mod_name, None)
-        raise
-    _site_login_module_cache = (key, mtime, mod)
-    return mod
 
 
 def _build_hdhive_site_login_opener(proxy: ProxyConfig | None) -> urllib.request.OpenerDirector:
@@ -490,6 +462,11 @@ def _iter_digit_prefixed_json_dicts(text: str):
         next_i = j + 1 if j > i else i + 1
         if isinstance(data, dict):
             yield data
+        elif merged and re.search(r'"success"\s*:\s*false', merged, flags=re.I):
+            em = _pick_rsc_quoted_string_field(merged, "message").strip()
+            ed = _pick_rsc_quoted_string_field(merged, "description").strip()
+            if em or ed:
+                yield {"error": {"success": False, "message": em, "description": ed}}
         i = next_i
 
 
@@ -584,6 +561,109 @@ def parse_api_checkin_message(text: str) -> tuple[str, str]:
     return (msg, desc)
 
 
+def _refine_cookie_checkin_message_fields(raw_w: str, msg0: str, desc0: str) -> tuple[str, str]:
+    """与 ``run_hdhive_checkin`` cookie 分支内 RSC 纠正逻辑一致（供 in-process 与子进程 JSON 结果共用）。"""
+    msg0 = (msg0 or "").strip()
+    desc0 = (desc0 or "").strip()
+    pm, pd = parse_hdhive_site_rsc_message(raw_w)
+    if raw_w and re.search(r'"success"\s*:\s*false', raw_w) and not (pm or pd):
+        pm, pd = _parse_hdhive_site_rsc_message_loose_window(raw_w)
+    if raw_w and re.search(r'"success"\s*:\s*false', raw_w) and (pm or pd):
+        msg0 = pm or msg0
+        desc0 = pd or desc0
+    elif (pm or pd) and msg0 == "签到完成" and (not desc0 or desc0 == "签到成功"):
+        msg0 = pm or msg0
+        desc0 = pd or desc0
+    blob = raw_w or ""
+    wrong_generic = msg0 == "签到完成" and (not desc0 or desc0 == "签到成功")
+    if wrong_generic and (
+        re.search(r'"success"\s*:\s*false', blob)
+        or any(
+            n in blob
+            for n in ("已经签到", "签到过了", "明天再来", "重复签到", "无需重复", "签到失败")
+        )
+    ):
+        pm3, pd3 = parse_hdhive_site_rsc_message(raw_w)
+        if not (pm3 or pd3):
+            pm3, pd3 = _parse_hdhive_site_rsc_message_loose_window(raw_w)
+        if pm3 or pd3:
+            msg0 = pm3 or msg0
+            desc0 = pd3 or desc0
+    return msg0, desc0
+
+
+def run_cookie_checkin_via_site_login_script(
+    env: dict[str, str],
+    *,
+    is_gambler: bool,
+) -> tuple[int, str, str, str, object, str, bool]:
+    """控制台「测试签到 / 立即签到」cookie 路径：子进程执行 ``hdhive_site_login_checkin.py --emit-json-result``。
+
+    返回元组与 ``run_hdhive_checkin`` 的 cookie 模式相同，便于 Web 层复用 ``_enrich_*`` / 写回 Cookie。
+    """
+    user = (env.get("HDHIVE_LOGIN_USERNAME") or env.get("HDHIVE_LOGIN_EMAIL") or "").strip()
+    pwd = (env.get("HDHIVE_LOGIN_PASSWORD") or "").strip()
+    if not user or not pwd:
+        return (
+            400,
+            "",
+            "配置不完整",
+            "请填写 HDHIVE_LOGIN_USERNAME（或 HDHIVE_LOGIN_EMAIL）与 HDHIVE_LOGIN_PASSWORD。",
+            {},
+            "",
+            False,
+        )
+    path = _hdhive_site_login_script_path()
+    if not path.is_file():
+        detail = f"未找到网页登录脚本：{path}"
+        return -2, detail, "模块缺失", detail, {}, "", False
+    cmd: list[str] = [sys.executable, str(path), "--username", user, "--password", pwd, "--emit-json-result"]
+    if is_gambler:
+        cmd.append("--gambler")
+    child_env = os.environ.copy()
+    for k, v in env.items():
+        if v is None:
+            continue
+        child_env[str(k)] = str(v)
+    child_env["HDHIVE_LOGIN_USERNAME"] = user
+    child_env["HDHIVE_LOGIN_PASSWORD"] = pwd
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=child_env,
+            cwd=str(Path.cwd()),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return -2, "", "执行超时", "hdhive_site_login_checkin 子进程超时", {}, "", False
+    except OSError as exc:
+        return -2, "", "无法启动子进程", str(exc), {}, "", False
+    out = (proc.stdout or "").strip()
+    if not out:
+        err = (proc.stderr or "").strip()
+        return -2, err or "(empty stdout)", "子进程无输出", err or "stdout 为空", {}, "", False
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        merged = (out + "\n" + (proc.stderr or "")).strip()[:8000]
+        return -2, merged, "解析失败", "子进程 stdout 非合法 JSON", {}, "", False
+    raw_w = str(data.get("raw") or "")
+    http_status = int(data.get("http_status") or 0)
+    exit_code = int(data.get("exit_code") if data.get("exit_code") is not None else 1)
+    ck = str(data.get("cookie_header") or "")
+    msg0 = str(data.get("message") or "").strip()
+    desc0 = str(data.get("description") or "").strip()
+    msg0, desc0 = _refine_cookie_checkin_message_fields(raw_w, msg0, desc0)
+    desc_for_fmt = desc0
+    if exit_code != 0 and not (desc_for_fmt or "").strip():
+        desc_for_fmt = raw_w[:1200] if raw_w else ""
+    msg, desc = format_hdhive_cookie_checkin_display(http_status, raw_w, msg0, desc_for_fmt)
+    ok = exit_code == 0
+    return http_status, raw_w, msg, desc, {}, ck, ok
+
+
 def run_hdhive_checkin(
     *,
     method: str,
@@ -596,9 +676,8 @@ def run_hdhive_checkin(
     """
     执行签到。返回 ``(http_status, raw_body, message, description, response_headers, new_cookie_header, ok)``。
 
-    ``cookie`` 模式（界面仍保留该取值）：仅通过 ``HDHIVE_LOGIN_USERNAME`` / ``HDHIVE_LOGIN_EMAIL`` 与
-    ``HDHIVE_LOGIN_PASSWORD`` 加载 ``hdhive/hdhive_site_login_checkin.py`` 登录并签到；第六项为登录后会话
-    ``Cookie`` 整串（可写回 ``HDHIVE_COOKIE``）。不再使用仅 Cookie 的直签 POST。第七项 ``ok`` 为脚本
+    ``cookie`` 模式：子进程执行 ``hdhive/hdhive_site_login_checkin.py --emit-json-result``（见
+    ``run_cookie_checkin_via_site_login_script``）；第六项为登录后会话 ``Cookie`` 整串；第七项 ``ok`` 为脚本
     ``exit_code == 0``（与 HTTP 状态可能不一致时以该项为准）。
 
     API Key 模式第五、六项分别为 ``{}``、``""``；第七项为 ``http_status == 200``。
@@ -618,83 +697,7 @@ def run_hdhive_checkin(
                 "",
                 False,
             )
-        path = _hdhive_site_login_script_path()
-        chk_log = logging.getLogger("tg_forwarder.hdhive")
-        try:
-            mod = _load_hdhive_site_login_module()
-            if mod is None:
-                detail = f"未找到网页登录脚本：{path}"
-                return (
-                    -2,
-                    detail,
-                    "模块缺失",
-                    detail,
-                    {},
-                    "",
-                    False,
-                )
-            opener = _build_hdhive_site_login_opener(proxy)
-            next_login_action = (env.get("HDHIVE_LOGIN_NEXT_ACTION") or "").strip()
-            next_login_rt = (env.get("HDHIVE_LOGIN_NEXT_ROUTER_STATE_TREE") or "").strip()
-            ck_na, ck_rt = cookie_checkin_next_meta_from_env(env)
-            res = mod.run_site_login_checkin(
-                opener,
-                username=user,
-                password=pwd,
-                redirect="/",
-                do_checkin=True,
-                is_gambler=is_gambler,
-                login_next_action=next_login_action,
-                login_router_tree=next_login_rt,
-                checkin_next_action=ck_na,
-                checkin_router_tree=ck_rt,
-            )
-        except ValueError as exc:
-            err_s = str(exc)
-            return -2, err_s, "代理错误", err_s, {}, "", False
-        except (OSError, urllib.error.URLError) as exc:
-            err_s = str(exc)
-            return -1, err_s, "网络错误", err_s, {}, "", False
-        except Exception as exc:
-            chk_log.exception("HDHive 网页账号签到过程异常")
-            err_s = f"{type(exc).__name__}: {exc}"
-            return -2, err_s, "执行异常", err_s, {}, "", False
-
-        raw_w = res.raw or ""
-        msg0 = (res.message or "").strip()
-        desc0 = (res.description or "").strip()
-        pm, pd = parse_hdhive_site_rsc_message(raw_w)
-        if raw_w and re.search(r'"success"\s*:\s*false', raw_w) and not (pm or pd):
-            pm, pd = _parse_hdhive_site_rsc_message_loose_window(raw_w)
-        # 1) 正文中含 success:false：以主包解析为准（与 CLI 一致）
-        if raw_w and re.search(r'"success"\s*:\s*false', raw_w) and (pm or pd):
-            msg0 = pm or msg0
-            desc0 = pd or desc0
-        # 2) 容器内若仍为旧脚本误报「签到完成」+「签到成功」，但 RSC 里已有 error 文案，则强制纠正
-        elif (pm or pd) and msg0 == "签到完成" and (not desc0 or desc0 == "签到成功"):
-            msg0 = pm or msg0
-            desc0 = pd or desc0
-        # 3) 解析未命中 pm/pd，但正文明显是业务错误/已签到，仍勿保留泛化成功句
-        blob = raw_w or ""
-        wrong_generic = msg0 == "签到完成" and (not desc0 or desc0 == "签到成功")
-        if wrong_generic and (
-            re.search(r'"success"\s*:\s*false', blob)
-            or any(
-                n in blob
-                for n in ("已经签到", "签到过了", "明天再来", "重复签到", "无需重复", "签到失败")
-            )
-        ):
-            pm3, pd3 = parse_hdhive_site_rsc_message(raw_w)
-            if not (pm3 or pd3):
-                pm3, pd3 = _parse_hdhive_site_rsc_message_loose_window(raw_w)
-            if pm3 or pd3:
-                msg0 = pm3 or msg0
-                desc0 = pd3 or desc0
-        desc = desc0
-        if res.exit_code != 0 and not desc:
-            desc = res.raw[:1200] if res.raw else ""
-        msg, desc = format_hdhive_cookie_checkin_display(res.http_status, res.raw, msg0, desc)
-        return res.http_status, res.raw, msg, desc, {}, res.cookie_header, res.exit_code == 0
+        return run_cookie_checkin_via_site_login_script(env, is_gambler=is_gambler)
 
     status, raw = post_hdhive_checkin_api(api_key, is_gambler, proxy)
     msg, desc = parse_api_checkin_message(raw) if status > 0 else ("", "")
@@ -882,6 +885,46 @@ def _truncate_for_cli(text: str, max_chars: int) -> tuple[str, bool]:
     return text[:max_chars], True
 
 
+def _run_site_login_checkin_subprocess(values: dict[str, str], *, is_gambler: bool) -> int:
+    """命令行 cookie 模式：子进程执行 ``hdhive_site_login_checkin.py``，与手动 ``python hdhive/...`` 输出一致。"""
+    path = _hdhive_site_login_script_path()
+    if not path.is_file():
+        print(f"未找到网页登录脚本: {path}", file=sys.stderr)
+        return 2
+    login_u = (values.get("HDHIVE_LOGIN_USERNAME") or values.get("HDHIVE_LOGIN_EMAIL") or "").strip()
+    login_p = (values.get("HDHIVE_LOGIN_PASSWORD") or "").strip()
+    if not login_u or not login_p:
+        print(
+            "非 Premium 模式需要 HDHIVE_LOGIN_USERNAME（或 HDHIVE_LOGIN_EMAIL）与 HDHIVE_LOGIN_PASSWORD。",
+            file=sys.stderr,
+        )
+        return 2
+    cmd: list[str] = [sys.executable, str(path), "--username", login_u, "--password", login_p]
+    if is_gambler:
+        cmd.append("--gambler")
+    child_env = os.environ.copy()
+    for k, v in values.items():
+        if v is None:
+            continue
+        child_env[str(k)] = str(v)
+    child_env["HDHIVE_LOGIN_USERNAME"] = login_u
+    child_env["HDHIVE_LOGIN_PASSWORD"] = login_p
+    try:
+        proc = subprocess.run(
+            cmd,
+            env=child_env,
+            cwd=str(Path.cwd()),
+            check=False,
+        )
+    except OSError as exc:
+        print(f"无法启动子进程 {path}: {exc}", file=sys.stderr)
+        return 2
+    rc = int(proc.returncode if proc.returncode is not None else 1)
+    if rc in (0, 1, 2):
+        return rc
+    return 1 if rc != 0 else 0
+
+
 def run_hdhive_checkin_once_from_env(
     env_path: Path,
     *,
@@ -892,6 +935,8 @@ def run_hdhive_checkin_once_from_env(
     show_raw_max: int = 80_000,
     next_action: str | None = None,
     next_router_state_tree: str | None = None,
+    cli_login_username: str = "",
+    cli_login_password: str = "",
 ) -> int:
     """
     命令行单次签到：读 ``HDHIVE_CHECKIN_METHOD``、网页账号或 API Key，不读写签到状态文件。
@@ -900,14 +945,39 @@ def run_hdhive_checkin_once_from_env(
     ``use_proxy`` / ``tg_proxy`` / ``checkin_proxy_url`` 仅用于 CLI，合并进配置后再解析代理；
     与 ``resolve_hdhive_proxy`` 一致：未设 ``HDHIVE_CHECKIN_PROXY_URL`` 时使用 ``TG_PROXY_*``。
 
-    ``show_raw`` 为真时向 stdout 打印响应正文（便于调试 RSC / 解析失败）；默认不打印以免刷屏。
+    **Cookie 模式**：直接 ``subprocess`` 执行 ``hdhive_site_login_checkin.py``，stdout/stderr/退出码与子进程一致；
+    ``--show-raw`` 对子进程不生效（子脚本无该参数），需要全文时请直接运行 hdhive 脚本。
+
+    ``cli_login_username`` / ``cli_login_password`` 非空时覆盖 ``.env`` 中对应项；**两者均传时强制**
+    ``HDHIVE_CHECKIN_METHOD=cookie``，便于与 ``python hdhive/hdhive_site_login_checkin.py --username … --password …`` 对照。
+    若 ``env_path`` 文件不存在，仅当两者均传时使用空配置（代理等依赖进程环境变量）。
     """
+    env_p = Path(env_path)
+    u_cli = (cli_login_username or "").strip()
+    p_cli = (cli_login_password or "").strip()
+    if env_p.is_file():
+        base = read_env_file(env_p)
+    else:
+        if not (u_cli and p_cli):
+            print(
+                f"找不到 .env: {env_p.resolve()}。请创建该文件，或与 hdhive_site_login_checkin.py 一样同时指定 "
+                "`--username` 与 `--password`（可不经 .env）。",
+                file=sys.stderr,
+            )
+            return 2
+        base = {}
     values = _merge_cli_checkin_proxy(
-        read_env_file(env_path),
+        base,
         use_proxy=use_proxy,
         tg_proxy=tg_proxy,
         checkin_proxy_url=checkin_proxy_url,
     )
+    if u_cli:
+        values["HDHIVE_LOGIN_USERNAME"] = u_cli
+    if p_cli:
+        values["HDHIVE_LOGIN_PASSWORD"] = p_cli
+    if u_cli and p_cli:
+        values["HDHIVE_CHECKIN_METHOD"] = "cookie"
     if next_action and next_action.strip():
         values["HDHIVE_CHECKIN_NEXT_ACTION"] = next_action.strip()
     if next_router_state_tree and next_router_state_tree.strip():
@@ -928,6 +998,13 @@ def run_hdhive_checkin_once_from_env(
                 file=sys.stderr,
             )
             return 2
+        if show_raw:
+            print(
+                "提示：cookie 模式由子进程执行 hdhive_site_login_checkin.py，输出与 ``python hdhive/hdhive_site_login_checkin.py`` 一致；"
+                "本入口的 --show-raw 不作用于子进程。",
+                file=sys.stderr,
+            )
+        return _run_site_login_checkin_subprocess(values, is_gambler=is_gambler)
     elif not api_key:
         print("API Key 模式需要 .env 中配置 HDHIVE_API_KEY。", file=sys.stderr)
         return 2
@@ -940,18 +1017,17 @@ def run_hdhive_checkin_once_from_env(
         proxy=proxy,
         hdhive_env=values,
     )
-    print(f"HTTP {status}")
-    if msg:
-        print(f"message: {msg}")
-    if desc:
-        print(f"description: {desc}")
     raw_len = len(raw or "")
-    if show_raw:
+    print(f"HTTP {status}")
+    line = " ".join(x for x in ((msg or "").strip(), (desc or "").strip()) if x).strip()
+    if line:
+        print(line)
+    if show_raw and raw_len:
         body, cut = _truncate_for_cli(raw or "", show_raw_max)
         print(f"--- response body ({raw_len} chars{'，已截断' if cut else ''}) ---")
         print(body)
         print("--- end response body ---")
-    elif status >= 0 and raw_len and method == HDHIVE_METHOD_COOKIE:
+    elif status >= 0 and raw_len:
         print(f"response_bytes: {raw_len}（加 --show-raw 打印正文）", file=sys.stderr)
     if status < 0:
         print(raw, file=sys.stderr)
@@ -971,13 +1047,34 @@ def _cli_main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="HDHive 单次签到（读取 .env：HDHIVE_CHECKIN_METHOD、HDHIVE_LOGIN_* 或 HDHIVE_API_KEY）",
+        description=(
+            "HDHive 单次签到（读取 .env：HDHIVE_CHECKIN_METHOD、HDHIVE_LOGIN_* 或 HDHIVE_API_KEY）。"
+            "cookie 模式直接子进程执行 ``hdhive/hdhive_site_login_checkin.py``（输出与手动运行该脚本一致）；"
+            "``--username`` + ``--password`` 强制 cookie 并覆盖 .env 账号。"
+        ),
     )
     parser.add_argument(
         "--env-file",
         type=Path,
         default=Path(".env"),
-        help=".env 路径（默认 ./.env）",
+        help=".env 路径（默认 ./.env）；若文件不存在，须同时传 --username 与 --password",
+    )
+    parser.add_argument(
+        "--username",
+        "--email",
+        "--login-username",
+        dest="cli_login_username",
+        default="",
+        metavar="USER",
+        help="网页签到用户名或邮箱（覆盖 .env；与 --password 均传时强制 cookie，对齐 hdhive_site_login_checkin.py）",
+    )
+    parser.add_argument(
+        "--password",
+        "--login-password",
+        dest="cli_login_password",
+        default="",
+        metavar="PASS",
+        help="网页签到密码（覆盖 .env）",
     )
     parser.add_argument(
         "--use-proxy",
@@ -1001,7 +1098,10 @@ def _cli_main() -> int:
     parser.add_argument(
         "--show-raw",
         action="store_true",
-        help="将 HTTP 响应正文打印到 stdout（调试 RSC / 解析不到签到文案时使用；过长时由 --show-raw-max 截断）",
+        help=(
+            "在「响应摘录」之后再打印更长 response body（cookie 模式便于与 hdhive 脚本全文对比；"
+            "Premium 模式仅打印该段）。过长时由 --show-raw-max 截断。"
+        ),
     )
     parser.add_argument(
         "--show-raw-max",
@@ -1023,9 +1123,6 @@ def _cli_main() -> int:
         help="覆盖本次签到的 Next-Router-State-Tree（与浏览器一致；也可写 .env 的 HDHIVE_CHECKIN_NEXT_ROUTER_STATE_TREE）",
     )
     args = parser.parse_args()
-    if not args.env_file.is_file():
-        print(f"找不到文件: {args.env_file.resolve()}", file=sys.stderr)
-        return 2
     return run_hdhive_checkin_once_from_env(
         args.env_file,
         use_proxy=args.use_proxy,
@@ -1035,6 +1132,8 @@ def _cli_main() -> int:
         show_raw_max=max(0, args.show_raw_max),
         next_action=args.next_action,
         next_router_state_tree=args.next_router_state_tree,
+        cli_login_username=getattr(args, "cli_login_username", "") or "",
+        cli_login_password=getattr(args, "cli_login_password", "") or "",
     )
 
 

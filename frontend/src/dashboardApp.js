@@ -613,23 +613,37 @@ export default {
         this._hdhiveCheckinNoticeFromResponse(response) || response.message || "",
       ).trim();
       const envTop = String(response.message || "").trim();
-      this.notice = "";
-      this.noticeModalTitle = "";
-      this.noticeModalBody = "";
-      this.noticeModalIsError = false;
-      if (title || desc) {
-        // 正文以 data.checkin_message / checkin_description 为准（与 CLI 空格拼接一行一致）
-        const oneLine = [title, desc].filter(Boolean).join(" ").trim();
-        let extra = "";
-        if (envTop && envTop !== oneLine) {
+      const envFirst = envTop.split(/\n/)[0]?.trim() || "";
+
+      /** 与 CLI ``print(message, description, sep=" ")``、接口 ``ApiResponse.message`` 一致：一行主文案。 */
+      let primary = [title, desc].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+      if (!desc && title && envFirst.startsWith(title) && envFirst.length > title.length) {
+        primary = envFirst;
+      }
+      if (!primary) {
+        primary = envFirst;
+      }
+      if (!primary) {
+        primary = merged.split(/\n/)[0]?.trim() || merged;
+      }
+
+      let extra = "";
+      if (envTop && primary) {
+        if (envTop.startsWith(primary) && envTop.length > primary.length) {
+          extra = envTop
+            .slice(primary.length)
+            .trim()
+            .replace(/^[\s,，.。;；\-—]+/u, "")
+            .trim();
+        } else if (envTop !== primary) {
           const stripLead = (s, prefix) =>
             String(s || "")
               .trim()
               .slice(String(prefix || "").length)
               .trim()
-              .replace(/^[\s,，.。;；\-—]+/, "");
-          if (oneLine && envTop.startsWith(oneLine)) {
-            extra = stripLead(envTop, oneLine);
+              .replace(/^[\s,，.。;；\-—]+/u, "");
+          if (primary && envTop.startsWith(primary)) {
+            extra = stripLead(envTop, primary);
           } else if (title && envTop.startsWith(title)) {
             const rest = stripLead(envTop, title);
             if (rest && rest !== desc) {
@@ -639,8 +653,16 @@ export default {
             extra = envTop;
           }
         }
-        this.noticeModalTitle = "提示";
-        this.noticeModalBody = [oneLine, extra].filter(Boolean).join("\n\n").trim();
+      }
+
+      this.notice = "";
+      this.noticeModalTitle = "";
+      this.noticeModalBody = "";
+      this.noticeModalIsError = false;
+      if (primary || extra) {
+        // 不展示「签到结果」等固定标题：主文案即 checkin_message + 空格 + checkin_description（与 CLI 一致）
+        this.noticeModalTitle = primary;
+        this.noticeModalBody = extra || "";
         this.noticeModalIsError = response.data?.checkin_ok === false;
       } else {
         this.notice = merged || envTop || "已完成请求。";
@@ -1810,7 +1832,7 @@ export default {
       };
 
       let detail = "";
-      if (title && desc) detail = `${title}\n\n${desc}`;
+      if (title && desc) detail = `${title} ${desc}`.replace(/\s+/g, " ").trim();
       else if (title) detail = title;
       else if (desc) detail = desc;
 

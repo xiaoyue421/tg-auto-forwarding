@@ -451,10 +451,78 @@ npm run build
 
 这种错误一般只影响“启动通知”，不一定代表主转发逻辑已经完全不可用。
 
+## 仓库内 HDHive 工具（`hdhive/`）
+
+目录 **`hdhive/`** 提供与 [HDHive](https://hdhive.com) 相关的独立脚本与小型 Python 包；**控制台里的签到、资源解析与自动解锁** 仍主要通过 `.env` 与 `tg_forwarder` 完成（见上文「快速开始」中的 `HDHIVE_*` 与站点设置页）。原独立文档 **`hdhive/help.md`** 已合并到本节，发布单仓时无需再维护该文件。
+
+### `hdhive_site_login_checkin.py`（非 Premium：网页登录 + 签到）
+
+- **用途**：用户名/邮箱 + 密码经站点 Server Action 登录，并在登录态下执行首页签到；与 Web 控制台「非 Premium」**测试签到 / 立即签到**、以及 Worker 定时签到（cookie 模式）使用同一子进程脚本。
+- **运行**：在仓库根执行 `python hdhive/hdhive_site_login_checkin.py`（可从当前目录或上级目录的 `.env` 读取 `HDHIVE_LOGIN_*`；亦支持 `--username` / `--password`）。Docker 中可通过 `HDHIVE_SITE_LOGIN_SCRIPT` 指向副本路径。
+- **环境变量**：见 `.env.example` 中的 `HDHIVE_LOGIN_*`、`HDHIVE_CHECKIN_*`、代理相关键。
+
+### `hdhive.py`（OpenAPI CLI，仅标准库）
+
+单文件封装 HDHive OpenAPI 常用能力（查询、解锁、分享写入、VIP、OAuth 辅助等），**不依赖**除标准库外的 pip 包。
+
+**全局参数**（各子命令通用）：
+
+| 参数 | 说明 |
+|------|------|
+| `--base-url` | API 根地址，默认 `https://hdhive.com` |
+| `--api-key` | 必填，OpenAPI Key 或应用 Secret |
+| `--access-token` | 可选；涉及用户身份的业务（解锁、签到、分享写入等）建议传入 |
+| `--timeout` | 超时秒数，默认 `30` |
+| `--pretty` | 将 JSON 输出格式化 |
+
+**常用命令**（更多子命令与参数请 `-h`）：
+
+```powershell
+python hdhive/hdhive.py -h
+python hdhive/hdhive.py --api-key "YOUR_KEY" --pretty ping
+python hdhive/hdhive.py --api-key "YOUR_KEY" --pretty quota
+python hdhive/hdhive.py --api-key "KEY" --access-token "TOKEN" --pretty usage-today
+python hdhive/hdhive.py --api-key "KEY" --access-token "TOKEN" --pretty checkin
+python hdhive/hdhive.py --api-key "KEY" --access-token "TOKEN" --pretty unlock --slug "YOUR_SLUG"
+```
+
+**子命令一览**：`ping`、`quota`、`usage`、`usage-today`、`resources`、`unlock`、`check-resource`、`share`、`shares`、`share-create`、`share-patch`、`share-delete`、`me`、`checkin`、`weekly-free-quota`、`oauth-authorize-preview`、`oauth-exchange-code`、`oauth-refresh`、`oauth-revoke`。
+
+**作为 Python 模块**（开发安装 `pip install -e .` 后，在含包根的路径下）：
+
+```python
+from hdhive import HDHiveClient
+
+client = HDHiveClient("https://hdhive.com", "your-api-key").with_access_token("user-access-token")
+resp = client.resources("movie", "550")
+print(resp)
+```
+
+**错误与重试**：遇 HTTP 429 应按响应中的 `Retry-After` 或 JSON 里的 `retry_after_seconds` 退避；`OPENAPI_USER_REQUIRED` 表示需 `--access-token`；`INSUFFICIENT_POINTS` 表示解锁积分不足。失败时 stderr 常含结构化错误 JSON，进程退出码为 `1` 或 `2`。
+
+### `auto_unlock.py`（按 slug 先查 share 再决定是否 unlock）
+
+在 `hdhive.py` 客户端之上封装「先 `share`、再按免费/积分规则判断是否 `unlock`」。默认仅在免费资源条件下自动解锁；使用 `--allow-paid --max-points N` 时，若 `unlock_points <= N` 也会尝试解锁。
+
+```powershell
+python hdhive/auto_unlock.py -h
+python hdhive/auto_unlock.py --api-key "KEY" --slug "SLUG" --pretty
+python hdhive/auto_unlock.py --api-key "KEY" --slug "SLUG" --allow-paid --max-points 4 --url-only
+```
+
+**退出码**：`0` 成功；`1` OpenAPI 业务错误；`2` 脚本内部异常；`3`（仅 `--url-only`）不满足解锁条件因而未输出 URL。批量处理多 slug 时可用 shell 逐行读取 slug 文件并循环调用上述命令。
+
+### `unlock_core.py`
+
+与 `tg_forwarder.hdhive_unlock_core` 对齐的判定与解析逻辑，供 `auto_unlock.py` 与转发链路中的「HDHive 自动解锁」策略复用。
+
+---
+
 ## 项目结构
 
 ```text
 frontend/                Vite + Vue 3 控制台源码（npm run build 产出到 web/static）
+hdhive/                  HDHive：网页签到脚本、OpenAPI CLI、自动解锁辅助与包入口
 src/tg_forwarder/
   cli.py                 命令行入口
   webapp.py              FastAPI Web 控制台
