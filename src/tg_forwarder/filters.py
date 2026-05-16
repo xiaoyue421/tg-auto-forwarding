@@ -18,6 +18,15 @@ from tg_forwarder.hdhive_resource_resolve import (
 )
 from tg_forwarder.message_index import extract_message_keyword_values, extract_message_text_values
 
+try:
+    from tgph.extract import collect_telegra_ph_urls_from_message
+    from tgph.resolve import resolve_tgph_dispatch_text
+except ImportError:  # pragma: no cover - tgph 为仓库根可选包
+    collect_telegra_ph_urls_from_message = None  # type: ignore[assignment,misc]
+    resolve_tgph_dispatch_text = None  # type: ignore[assignment,misc]
+
+MATCH_VIA_TGPH_PAGE = "tgph_page"
+
 MATCH_VIA_NONE = "none"
 MATCH_VIA_MESSAGE = "message"
 _HDHIVE_UNLOCK_MISSING_KEY_WARNED = False
@@ -222,6 +231,7 @@ async def explain_message_match(
         any_unlock_skipped_unknown_points = False
         any_unlock_skipped_disabled = False
         openapi_base = effective_hdhive_openapi_base_url(values)
+
         for url in urls:
             # --- API-only：按 hdhive/auto_unlock.py 规则（先 share 再自动解锁） ---
             if unlock_enabled and api_key:
@@ -277,6 +287,86 @@ async def explain_message_match(
             return "HDHive 积分解锁失败"
         return "链接失效"
 
+    def _maybe_resolve_tgph_override() -> str | None:
+        """Telegra.ph 独立模式：抓取文章 HTML，按页面内容匹配规则后提取直链（与 HDHive 无关）。"""
+        if not bool(getattr(filters, "tgph_resolve_forward", False)):
+            return None
+        if resolve_tgph_dispatch_text is None:
+            return None
+        tg_result = resolve_tgph_dispatch_text(
+            message,
+            filters,
+            env_config_path=env_config_path,
+            env_values=env_values,
+        )
+        if tg_result.matched and tg_result.dispatch_text.strip():
+            return tg_result.dispatch_text.strip()
+        if tg_result.error_message and bool(getattr(filters, "tgph_require_rule_match", False)):
+            return tg_result.error_message
+        return None
+
+    # Telegraph（tgph_resolve_forward）：消息须含 telegra.ph；匹配与提取均针对页面 HTML。
+    if bool(getattr(filters, "tgph_resolve_forward", False)):
+        telegra_urls: list[str] = []
+        if collect_telegra_ph_urls_from_message is not None:
+            telegra_urls = collect_telegra_ph_urls_from_message(message, max_urls=3)
+        if telegra_urls:
+            require_rule_match = bool(getattr(filters, "tgph_require_rule_match", False))
+            if require_rule_match and not has_positive_primary_filters(filters):
+                return MessageMatchResult(
+                    matched=False,
+                    has_media=has_media,
+                    has_text=has_text,
+                    missing_content_parts=missing_content_parts,
+                )
+            if not require_rule_match:
+                override = _maybe_resolve_tgph_override()
+                if override:
+                    result = MessageMatchResult(
+                        matched=True,
+                        matched_via=MATCH_VIA_TGPH_PAGE,
+                        has_media=has_media,
+                        has_text=has_text,
+                        missing_content_parts=missing_content_parts,
+                    )
+                    result.dispatch_text_override = override
+                    return result
+                return MessageMatchResult(
+                    matched=False,
+                    has_media=has_media,
+                    has_text=has_text,
+                    missing_content_parts=missing_content_parts,
+                )
+            tg_result = (
+                resolve_tgph_dispatch_text(
+                    message,
+                    filters,
+                    env_config_path=env_config_path,
+                    env_values=env_values,
+                )
+                if resolve_tgph_dispatch_text is not None
+                else None
+            )
+            if tg_result and tg_result.matched:
+                result = MessageMatchResult(
+                    matched=True,
+                    matched_via=MATCH_VIA_TGPH_PAGE,
+                    has_media=has_media,
+                    has_text=has_text,
+                    missing_content_parts=missing_content_parts,
+                )
+                result.dispatch_text_override = tg_result.dispatch_text
+                if tg_result.page_matched:
+                    if tg_result.direct_share_urls:
+                        result.matched_any = list(tg_result.direct_share_urls[:1])
+                return result
+            return MessageMatchResult(
+                matched=False,
+                has_media=has_media,
+                has_text=has_text,
+                missing_content_parts=missing_content_parts,
+            )
+
     # HDHive /resource 直链模式（hdhive_resource_resolve_forward）：
     # - 未勾选「仅命中规则时才转发 HDHive」：出现 resource 链接即尝试转发（仍先经过黑名单等）。
     # - 勾选「仅命中规则」：须与下方「命中任一关键词 / 必须全部命中 / 正则」等主规则一起判定；
@@ -312,7 +402,7 @@ async def explain_message_match(
             has_text=has_text,
             missing_content_parts=missing_content_parts,
         )
-        result.dispatch_text_override = _maybe_resolve_hdhive_override()
+        result.dispatch_text_override = _maybe_resolve_hdhive_override() or _maybe_resolve_tgph_override()
         return result
 
     evaluation = evaluate_keyword_filters_detailed(
@@ -334,7 +424,7 @@ async def explain_message_match(
             has_text=has_text,
             missing_content_parts=missing_content_parts,
         )
-        result.dispatch_text_override = _maybe_resolve_hdhive_override()
+        result.dispatch_text_override = _maybe_resolve_hdhive_override() or _maybe_resolve_tgph_override()
         return result
 
     return build_message_match_result(
@@ -375,6 +465,9 @@ def build_match_note(match_result: MessageMatchResult) -> str | None:
     if match_result.matched_via == MATCH_VIA_MESSAGE:
         parts.append("命中来源=主规则")
         details.append("主规则通过")
+    if match_result.matched_via == MATCH_VIA_TGPH_PAGE:
+        parts.append("命中来源=Telegraph页面")
+        details.append("tgph_page")
     if match_result.matched_all:
         parts.append(f"全部条件={','.join(match_result.matched_all)}")
         details.append(f"all:{','.join(match_result.matched_all)}")

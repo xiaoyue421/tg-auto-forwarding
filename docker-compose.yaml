@@ -55,7 +55,7 @@ x-tg-forwarder-common: &tg-forwarder-common
   environment:
     TZ: Asia/Shanghai
     PYTHONUNBUFFERED: "1"
-    PYTHONPATH: /workspace/src
+    PYTHONPATH: /workspace/src:/workspace
     TG_QUEUE_DB_PATH: /data/tg_forwarder_queue.sqlite3
     TG_BOT_START_RETRIES_PER_PROXY: "5"
     TG_BOT_POOL_START_STAGGER_SECONDS: "4"

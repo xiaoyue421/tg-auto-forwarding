@@ -18,6 +18,8 @@ function createRule(name = "rule_1") {
     regex_block: "",
     hdhive_resource_resolve_forward: false,
     hdhive_require_rule_match: false,
+    tgph_resolve_forward: false,
+    tgph_require_rule_match: false,
     media_only: false,
     text_only: false,
     content_match_mode: "all",
@@ -209,6 +211,11 @@ export default {
       hdhiveRealUnlockResult: null,
       /** API Key、网页登录凭据、Cookie 等：整块默认折叠（隐私）；展开后直接编辑，无二次显示隐藏 */
       hdhiveCredentialsOpen: false,
+      tgphTestBusy: false,
+      tgphTestUrl: "",
+      tgphSimulateRuleMatch: false,
+      tgphTestRuleIndex: 0,
+      tgphPreview: null,
       authBusy: false,
       authed: false,
       passwordInput: "",
@@ -809,6 +816,8 @@ export default {
         regex_block: this.normalizeMultilineText(rule.regex_block || ""),
         hdhive_resource_resolve_forward: Boolean(rule.hdhive_resource_resolve_forward),
         hdhive_require_rule_match: Boolean(rule.hdhive_require_rule_match),
+        tgph_resolve_forward: Boolean(rule.tgph_resolve_forward),
+        tgph_require_rule_match: Boolean(rule.tgph_require_rule_match),
       };
     },
     normalizeSourceItems(value) {
@@ -1951,6 +1960,38 @@ export default {
         this.error = this.normalizeCaughtError(err);
       } finally {
         this.hdhiveTestBusy = false;
+      }
+    },
+    async triggerTgphPreviewTest() {
+      this.tgphTestBusy = true;
+      this.tgphPreview = null;
+      this.notice = "";
+      this.error = "";
+      try {
+        const url = String(this.tgphTestUrl ?? "").trim();
+        if (!url) {
+          this.error = "请先粘贴 telegra.ph 文章链接。";
+          return;
+        }
+        const ruleIndex = Number(this.tgphTestRuleIndex) || 0;
+        const rule =
+          this.tgphSimulateRuleMatch && Array.isArray(this.config.rules) && this.config.rules[ruleIndex]
+            ? this.normalizeRule(this.config.rules[ruleIndex], ruleIndex)
+            : null;
+        const response = await this.fetchJson("/api/tgph/preview-test", {
+          method: "POST",
+          body: JSON.stringify({
+            url,
+            simulate_rule_match: Boolean(this.tgphSimulateRuleMatch),
+            rule,
+          }),
+        });
+        this.tgphPreview = response.data && typeof response.data === "object" ? response.data : null;
+        this.notice = String(response.message || "").trim() || "检测完成。";
+      } catch (err) {
+        this.error = this.normalizeCaughtError(err);
+      } finally {
+        this.tgphTestBusy = false;
       }
     },
     async triggerHdhiveResolveTest() {

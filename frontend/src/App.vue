@@ -835,6 +835,61 @@ export default dashboard;
               <button class="btn btn-primary btn-small" @click="addRule">新增规则</button>
             </div>
 
+            <div class="subpanel tgph-test-panel">
+              <div class="panel-head compact-head panel-head-wrap">
+                <div>
+                  <h3>Telegraph 页面检测</h3>
+                  <p class="panel-subtext">
+                    直接拉取 telegra.ph 文章 HTML，查看 ed2k / 115cdn 等直链（走已保存的 TG_PROXY_*）。可选按某条规则的页面匹配条件模拟。
+                  </p>
+                </div>
+              </div>
+              <input
+                v-model="tgphTestUrl"
+                class="inline-input"
+                placeholder="https://telegra.ph/一夜妻の寝言-1972-02-23"
+              />
+              <div class="toolbar compact-toolbar">
+                <label class="toggle">
+                  <input v-model="tgphSimulateRuleMatch" type="checkbox" />
+                  <span>按规则模拟页面 HTML 匹配（使用所选规则的关键词/正则）</span>
+                </label>
+                <label v-if="tgphSimulateRuleMatch">
+                  <span>规则</span>
+                  <select v-model.number="tgphTestRuleIndex" class="queue-history-select">
+                    <option v-for="(rule, idx) in config.rules" :key="idx" :value="idx">
+                      {{ rule.name || ('rule_' + (idx + 1)) }}
+                    </option>
+                  </select>
+                </label>
+                <button
+                  class="btn btn-primary btn-small"
+                  :disabled="tgphTestBusy"
+                  @click="triggerTgphPreviewTest"
+                >
+                  {{ tgphTestBusy ? '检测中...' : '检测 Telegraph 页面' }}
+                </button>
+              </div>
+              <div v-if="tgphPreview" class="tgph-preview-result">
+                <p class="panel-subtext">
+                  <strong>拉取</strong>：{{ tgphPreview.fetch_error || (tgphPreview.proxy_used ? '成功（已走代理）' : '成功') }}
+                  <template v-if="tgphPreview.page_matched !== null && tgphPreview.page_matched !== undefined">
+                    · <strong>规则匹配</strong>：{{ tgphPreview.page_matched ? '命中' : '未命中' }}
+                  </template>
+                  · ed2k {{ tgphPreview.ed2k_count || 0 }} 条 · 115cdn {{ tgphPreview.cdn115_count || 0 }} 条
+                </p>
+                <p v-if="tgphPreview.title_snippet" class="panel-subtext">摘要：{{ tgphPreview.title_snippet }}</p>
+                <p v-if="tgphPreview.matched_any && tgphPreview.matched_any.length" class="panel-subtext">
+                  命中任一：{{ tgphPreview.matched_any.join('、') }}
+                </p>
+                <p v-if="tgphPreview.dispatch_preview" class="panel-subtext"><strong>转发预览正文（前几条）：</strong></p>
+                <pre v-if="tgphPreview.dispatch_preview" class="tgph-preview-pre">{{ tgphPreview.dispatch_preview }}</pre>
+                <ul v-if="tgphPreview.direct_urls && tgphPreview.direct_urls.length" class="tgph-preview-lines">
+                  <li v-for="(link, i) in tgphPreview.direct_urls" :key="i"><code>{{ link }}</code></li>
+                </ul>
+              </div>
+            </div>
+
             <div class="rule-stack">
               <article
                 v-for="(rule, index) in config.rules"
@@ -964,6 +1019,22 @@ export default dashboard;
                       未勾选上一项时：只要消息里出现 <code>hdhive.com/resource/…</code> 即尝试直链转发（仍受黑名单等约束）。
                       勾选后：须同时满足本规则中的关键词或正则（与「命中任一关键词才转发」等配置一致）；请至少填写一类正向条件。
                       直链解锁使用「站点设置」中的 API Key 与 <code>HDHIVE_BASE_URL</code> 等（与<strong>测试签到</strong>是否成功无关）。
+                    </p>
+                    <label class="toggle span-2">
+                      <input type="checkbox" v-model="rule.tgph_resolve_forward" />
+                      <span>Telegraph：解析 telegra.ph 文章 HTML 并转发文内直链</span>
+                    </label>
+                    <label class="toggle span-2">
+                      <input
+                        type="checkbox"
+                        v-model="rule.tgph_require_rule_match"
+                        :disabled="!rule.tgph_resolve_forward"
+                      />
+                      <span>仅当 Telegraph 页面 HTML 命中下方关键词/正则时才转发（与 HDHive 无关）</span>
+                    </label>
+                    <p class="panel-subtext span-2">
+                      消息中须含 <code>telegra.ph/…</code> 链接。未勾选上一项时：拉取文章后只要文内有可转发直链（如
+                      <code>115cdn.com</code>）即转发。勾选后：用下方「命中任一 / 必须全部 / 正则」对<strong>文章 HTML 正文与文内链接</strong>做匹配，请至少填写一类正向条件。
                     </p>
                     <label class="toggle">
                       <input type="checkbox" v-model="rule.media_only" />

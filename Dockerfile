@@ -20,7 +20,7 @@ ENV TZ=Asia/Shanghai \
     PIP_NO_CACHE_DIR=1 \
     PIP_ROOT_USER_ACTION=ignore \
     PIP_DEFAULT_TIMEOUT=300 \
-    PYTHONPATH=/workspace/src \
+    PYTHONPATH=/workspace/src:/workspace \
     TG_QUEUE_DB_PATH=/data/tg_forwarder_queue.sqlite3
 
 WORKDIR /workspace
@@ -32,6 +32,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 # 非 Premium 网页签到依赖仓库根目录 hdhive/（与 PYTHONPATH=/workspace/src 下的 tg_forwarder 配套）
 COPY hdhive ./hdhive
+COPY tgph ./tgph
 COPY --from=dashboard /build/src ./src
 COPY --from=dashboard /build/src/tg_forwarder/web/static /opt/tg-forwarder-dashboard-static
 COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

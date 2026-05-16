@@ -157,6 +157,12 @@ class HdhiveResolveTestPayload(BaseModel):
     url: str = ""
 
 
+class TgphPreviewPayload(BaseModel):
+    url: str = ""
+    simulate_rule_match: bool = False
+    rule: RulePayload | None = None
+
+
 class LogsClearPayload(BaseModel):
     source: str = ""
     kind: str = "all"
@@ -216,6 +222,8 @@ class RulePayload(BaseModel):
     regex_block: str = ""
     hdhive_resource_resolve_forward: bool = False
     hdhive_require_rule_match: bool = False
+    tgph_resolve_forward: bool = False
+    tgph_require_rule_match: bool = False
     media_only: bool = False
     text_only: bool = False
     content_match_mode: str = CONTENT_MATCH_MODE_ALL
@@ -473,6 +481,19 @@ def _regex_extract_rsc_message_description(blob: str) -> tuple[str, str]:
     return "", ""
 
 
+def auto_start_workers_enabled(config_path: Path) -> bool:
+    """Web 进程启动后是否自动拉起转发 Worker（默认 true，适合 Docker 重启后自动恢复）。"""
+    raw: str | None = None
+    try:
+        values = read_env_file(config_path)
+        raw = values.get("TG_AUTO_START_WORKERS")
+    except OSError:
+        raw = None
+    if raw is None or not str(raw).strip():
+        raw = os.getenv("TG_AUTO_START_WORKERS", "true")
+    return parse_bool_string(str(raw).strip() or "true", default=True)
+
+
 def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     resolved_config_path = Path(config_path).resolve()
     log_handler = build_log_handler()
@@ -515,12 +536,23 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
     checkin_holder: list[object] = []
 
     @app.on_event("startup")
-    async def _startup_hdhive_checkin() -> None:
+    async def _startup_web_services() -> None:
         stop = asyncio.Event()
         log = logging.getLogger("tg_forwarder.hdhive")
         task_checkin = asyncio.create_task(hdhive_checkin_loop(stop, resolved_config_path, log))
         checkin_holder.clear()
         checkin_holder.extend([stop, task_checkin])
+
+        if auto_start_workers_enabled(resolved_config_path):
+            web_log = logging.getLogger("tg_forwarder.web")
+            try:
+                state = service.start()
+                web_log.info(
+                    "TG_AUTO_START_WORKERS: 已自动启动转发进程，status=%s",
+                    state.status,
+                )
+            except Exception:
+                web_log.exception("自动启动转发进程失败")
 
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
@@ -1461,6 +1493,67 @@ def build_web_app(config_path: str | Path = ".env") -> FastAPI:
             )
         return resp
 
+    def filter_config_from_rule_payload(rule: RulePayload):
+        from tg_forwarder.config import parse_filter_config
+
+        return parse_filter_config(
+            {
+                "keywords_any": split_list_value(rule.keywords_any),
+                "keywords_all": split_list_value(rule.keywords_all),
+                "block_keywords": split_list_value(rule.block_keywords),
+                "regex_any": split_regex_text(rule.regex_any),
+                "regex_all": split_regex_text(rule.regex_all),
+                "regex_block": split_regex_text(rule.regex_block),
+                "tgph_resolve_forward": bool(rule.tgph_resolve_forward),
+                "tgph_require_rule_match": bool(rule.tgph_require_rule_match),
+                "media_only": bool(rule.media_only),
+                "text_only": bool(rule.text_only),
+                "content_match_mode": rule.content_match_mode,
+                "case_sensitive": bool(rule.case_sensitive),
+            }
+        )
+
+    @app.post("/api/tgph/preview-test")
+    def tgph_preview_test(request: Request, payload: TgphPreviewPayload) -> ApiResponse:
+        """拉取 telegra.ph 文章 HTML，预览直链与（可选）按规则对页面内容匹配。不转发、不写队列。"""
+        ensure_authenticated(request)
+        url = (payload.url or "").strip()
+        if not url:
+            raise HTTPException(status_code=400, detail="请填写 telegra.ph 文章链接")
+        filters = None
+        rule_name = ""
+        if payload.simulate_rule_match:
+            if payload.rule is None:
+                raise HTTPException(status_code=400, detail="模拟规则匹配时请提供 rule 或先保存规则配置")
+            filters = filter_config_from_rule_payload(payload.rule)
+            rule_name = (payload.rule.name or "").strip()
+        try:
+            from tgph.preview import preview_telegra_ph_url
+        except ImportError as exc:
+            raise HTTPException(status_code=500, detail="tgph 模块未安装或未加入 PYTHONPATH") from exc
+
+        preview = preview_telegra_ph_url(
+            url,
+            env_config_path=resolved_config_path,
+            filters=filters,
+            require_rule_match=bool(payload.rule.tgph_require_rule_match) if payload.rule else None,
+            rule_name=rule_name,
+        )
+        data = preview.as_dict()
+        if preview.success:
+            msg = "Telegraph 页面拉取成功。"
+            if preview.page_matched is True:
+                msg += " 页面 HTML 已命中规则条件。"
+            elif preview.page_matched is False:
+                msg = preview.fetch_error or "页面 HTML 未命中规则条件。"
+            if preview.ed2k_count:
+                msg += f" 解析到 {preview.ed2k_count} 条 ed2k。"
+            if preview.cdn115_count:
+                msg += f" {preview.cdn115_count} 条 115cdn。"
+        else:
+            msg = preview.fetch_error or "Telegraph 页面检测未通过"
+        return ApiResponse(message=msg, data=data)
+
     @app.post("/api/hdhive/resolve-test")
     def hdhive_resolve_test(request: Request, payload: HdhiveResolveTestPayload) -> ApiResponse:
         """检测单条 HDHive /resource/ 链接的 API 自动解锁策略；不写入配置、不调用解锁接口。"""
@@ -1668,6 +1761,8 @@ def build_legacy_rule(values: dict[str, str]) -> RulePayload:
         regex_block=normalize_regex_text(values.get("TG_REGEX_BLOCK", ""), "TG_REGEX_BLOCK"),
         hdhive_resource_resolve_forward=parse_bool_string(values.get("TG_HDHIVE_RESOURCE_RESOLVE_FORWARD")),
         hdhive_require_rule_match=parse_bool_string(values.get("TG_HDHIVE_REQUIRE_RULE_MATCH")),
+        tgph_resolve_forward=parse_bool_string(values.get("TG_TGPH_RESOLVE_FORWARD")),
+        tgph_require_rule_match=parse_bool_string(values.get("TG_TGPH_REQUIRE_RULE_MATCH")),
         media_only=parse_bool_string(values.get("TG_MEDIA_ONLY")),
         text_only=parse_bool_string(values.get("TG_TEXT_ONLY")),
         content_match_mode=normalize_content_match_mode(
@@ -1724,6 +1819,8 @@ def rule_payload_from_dict(raw_rule: object, index: int) -> RulePayload:
         regex_block=keywords_to_text(filters.get("regex_block")),
         hdhive_resource_resolve_forward=bool(filters.get("hdhive_resource_resolve_forward", False)),
         hdhive_require_rule_match=bool(filters.get("hdhive_require_rule_match", False)),
+        tgph_resolve_forward=bool(filters.get("tgph_resolve_forward", False)),
+        tgph_require_rule_match=bool(filters.get("tgph_require_rule_match", False)),
         media_only=bool(filters.get("media_only", False)),
         text_only=bool(filters.get("text_only", False)),
         content_match_mode=normalize_content_match_mode(
@@ -1826,6 +1923,8 @@ def serialize_rules_to_json(rules: list[RulePayload]) -> str:
                 "regex_block": split_regex_text(rule.regex_block),
                 "hdhive_resource_resolve_forward": bool(rule.hdhive_resource_resolve_forward),
                 "hdhive_require_rule_match": bool(rule.hdhive_require_rule_match),
+                "tgph_resolve_forward": bool(rule.tgph_resolve_forward),
+                "tgph_require_rule_match": bool(rule.tgph_require_rule_match),
                 "media_only": bool(rule.media_only),
                 "text_only": bool(rule.text_only),
                 "content_match_mode": rule.content_match_mode,

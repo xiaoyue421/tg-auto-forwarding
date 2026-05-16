@@ -137,6 +137,8 @@ class FilterConfig:
     regex_block: list[str] = field(default_factory=list)
     hdhive_resource_resolve_forward: bool = False
     hdhive_require_rule_match: bool = False
+    tgph_resolve_forward: bool = False
+    tgph_require_rule_match: bool = False
     media_only: bool = False
     text_only: bool = False
     content_match_mode: str = CONTENT_MATCH_MODE_ALL
@@ -495,6 +497,14 @@ def build_legacy_env_worker(
                 env_optional_from(env_values, "TG_HDHIVE_REQUIRE_RULE_MATCH"),
                 False,
             ),
+            tgph_resolve_forward=parse_bool(
+                env_optional_from(env_values, "TG_TGPH_RESOLVE_FORWARD"),
+                False,
+            ),
+            tgph_require_rule_match=parse_bool(
+                env_optional_from(env_values, "TG_TGPH_REQUIRE_RULE_MATCH"),
+                False,
+            ),
             media_only=parse_bool(env_optional_from(env_values, "TG_MEDIA_ONLY"), False),
             text_only=parse_bool(env_optional_from(env_values, "TG_TEXT_ONLY"), False),
             content_match_mode=normalize_content_match_mode(
@@ -809,6 +819,8 @@ def parse_filter_config(
         regex_block=normalize_regex_patterns(data.get("regex_block"), "filters.regex_block"),
         hdhive_resource_resolve_forward=bool(data.get("hdhive_resource_resolve_forward", False)),
         hdhive_require_rule_match=bool(data.get("hdhive_require_rule_match", False)),
+        tgph_resolve_forward=bool(data.get("tgph_resolve_forward", False)),
+        tgph_require_rule_match=bool(data.get("tgph_require_rule_match", False)),
         media_only=media_only,
         text_only=text_only,
         content_match_mode=normalize_content_match_mode(

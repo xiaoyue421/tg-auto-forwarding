@@ -11,12 +11,13 @@
 - 多源到多目标、多对一转发
 - 支持账号目标和 Bot 目标同时配置
 - 支持规则级发送策略
-- 支持关键词、正则、黑名单、资源预设过滤
+- 支持关键词、正则、黑名单过滤
+- 支持 HDHive 资源链接识别与直链转发（可选自动解锁）
 - 支持“需要媒体”和“需要文本内容”组合判断
 - 支持历史消息搜索后手动指定转发
 - 支持本地发送队列、失败重试、成功历史去重
 - 支持失败任务智能重试（自动跳过不可重试错误、FloodWait 冷却）
-- 支持规则分组与优先级管理（分组启停、分组排序、分组筛选）
+- 支持规则 `group` / `priority`（经配置 JSON 或 API；后端按优先级排序）
 - 支持自动签到重试策略（指数退避 + 抖动 + 每日上限）
 - 支持健康检查与一键导出诊断包（脱敏配置 + 状态 + 日志）
 - 支持可选文件日志（按天滚动）
@@ -26,7 +27,7 @@
 
 - 监听频道 / 群里的消息并按规则转发
 - 将不同来源的资源消息集中整理到目标群
-- 按关键词、正则或资源类型自动筛选
+- 按关键词、正则或 HDHive 资源链接自动筛选
 - 需要后台查看实时转发日志和失败记录
 - 需要用用户账号监听，但按 Bot 或账号策略发送
 
@@ -128,29 +129,123 @@ Copy-Item .env.example .env
 - `HDHIVE_CHECKIN_RETRY_MAX_SECONDS=1800`：自动签到退避最大秒数
 - `HDHIVE_CHECKIN_RETRY_JITTER_SECONDS=15`：自动签到重试抖动秒数
 
-### 4. 生成 Telegram 登录会话
-
-```powershell
-python -m tg_forwarder login --config .env --save-env
-```
-
-### 5. 启动 Web 控制台
+### 4. 启动 Web 控制台
 
 ```powershell
 python -m tg_forwarder web --config .env --host 0.0.0.0 --port 8080
 ```
 
-浏览器打开：
+浏览器打开 `http://127.0.0.1:8080`，使用 `.env` 中的 `TG_DASHBOARD_PASSWORD` 登录（默认 `admin`，上线前请修改）。
 
-```text
-http://127.0.0.1:8080
+### 5. 登录 Telegram 账号
+
+任选其一即可，成功后都会写入 `.env` 的 `TG_SESSION_STRING`：
+
+| 方式 | 操作 |
+|------|------|
+| **网页（推荐）** | 控制台 → **基础配置** →「网页登录 Telegram」：验证码或扫码 |
+| **命令行** | `python -m tg_forwarder login --config .env --save-env` |
+
+监听转发必须使用**用户账号**会话；Bot Token 仅用于发送端（见「发送策略」）。
+
+---
+
+## 使用说明
+
+下面是从「装好依赖」到「稳定转发」的完整操作指引；日常维护以 **Web 控制台** 为主即可。
+
+### 推荐流程（首次配置）
+
+1. **准备 `.env`**：复制 `.env.example`，填写 `TG_API_ID`、`TG_API_HASH`、`TG_DASHBOARD_PASSWORD`。
+2. **构建前端**（本地非 Docker 时）：`cd frontend && npm install && npm run build`。
+3. **启动控制台**：`python -m tg_forwarder web --config .env --host 127.0.0.1 --port 8080`。
+4. **登录控制台**：浏览器打开控制台地址，输入控制台密码。
+5. **登录 Telegram**：在 **基础配置** 用验证码或扫码写入 `session_string`（见上文第 5 步）。
+6. **（可选）填写 Bot Token**：多个 Token 用英文逗号分隔；Bot 需已加入目标群并有发言权限。
+7. **配置转发规则**：在 **规则设置** 新增规则，填写源频道、账号/Bot 目标、关键词/正则等。
+8. **保存并校验**：顶栏 **保存配置** → **校验配置**，在 **运行与队列** 查看校验出的 Worker 列表。
+9. **启动监听**：顶栏 **启动后端**；侧边栏「服务」变为运行中，Worker 卡片显示「运行中」。
+10. **验证转发**：用**另一个账号**往源群发测试消息（默认不转发本账号自己发的消息），在 **系统日志** / 目标群确认。
+
+修改规则、Bot、代理等后建议：**保存配置** → **校验配置** → **重启后端**。
+
+Docker / Web 重启后默认会**自动启动转发进程**（`.env` 中 `TG_AUTO_START_WORKERS=true`，设为 `false` 则仍需在控制台手动点「启动后端」）。
+
+### 命令行工具
+
+安装 `pip install -e .` 后可用：
+
+| 命令 | 说明 |
+|------|------|
+| `python -m tg_forwarder web -c .env --host 0.0.0.0 --port 8080` | 启动 Web 控制台（主入口） |
+| `python -m tg_forwarder login -c .env --save-env` | 交互式生成 `TG_SESSION_STRING` 并写回 `.env` |
+| `python -m tg_forwarder validate -c .env` | 校验 `.env` / 规则，打印将运行的 Worker |
+| `python -m tg_forwarder run -c config.yaml` | 无 Web、仅用 YAML 配置跑转发（高级） |
+| `tg-hdhive-unlock "https://hdhive.com/resource/…"` | 按站点设置测试 HDHive 自动解锁（读 `.env`） |
+
+等价入口：`tg-forwarder web`（`pyproject.toml` 中注册的脚本名）。
+
+### 配置模式
+
+| 模式 | 适用场景 | 配置位置 |
+|------|----------|----------|
+| **多规则（推荐）** | 多源多目标、每条规则独立过滤 | 控制台 **规则设置**，保存后写入 `TG_RULES_JSON` |
+| **单规则简化** | 仅一对源/目标、不用控制台改规则 | `.env` 中 `TG_SOURCE_CHAT`、`TG_TARGET_CHATS` 等 |
+
+多规则模式下，`.env` 里的 `TG_SOURCE_CHAT` / `TG_TARGET_CHATS` 可仅作占位；若未配置任何规则且未填源频道，校验会提示 `simple mode requires TG_SOURCE_CHAT`。
+
+### 频道 / 群怎么写
+
+在规则或 `.env` 中，源与目标可使用：
+
+- `@channel_username` 或 `@group_username`
+- 数字 ID（如 `-1001234567890`）
+- `https://t.me/xxx` 形式链接（系统会解析）
+
+多个源：在规则里用**英文逗号、分号或换行**分隔。多个目标：账号目标、Bot 目标字段内用**英文逗号**分隔。
+
+监听账号须已加入源群/频道；发往目标时，登录账号或 Bot 也须在对应目标中，且具备发消息权限。
+
+### 控制台分区说明
+
+登录后左侧为工作区导航；顶栏固定有 **保存 / 校验 / 导出 / 导入配置** 与 **启动 / 重启 / 停止后端**。
+
+| 分区 | 作用 |
+|------|------|
+| **基础配置** | API ID/HASH、网页或手动 session、Bot Token、全局发送策略、全局限流、启动通知、代理 |
+| **站点设置** | HDHive 签到（Premium API Key / 非 Premium 网页账号）、自动签到、资源自动解锁、测试签到与转发路径检测 |
+| **模块** | 导入 `.zip` 或放置带 `module.json` 的扩展；`hooks.py` 的 `after_match` 在规则匹配后执行（改 hooks 需**重启后端**） |
+| **规则设置** | 多规则：源/目标、发送策略、关键词/正则、HDHive 直链、Telegraph（tgph）页面解析、媒体与文本条件 |
+| **消息搜索** | 对已配置源做关键词模糊搜索，支持按规则目标**手动转发**历史消息 |
+| **运行与队列** | Worker / Dispatcher 状态、失败队列智能重试、成功转发去重历史、校验结果 |
+| **系统日志** | 全部日志、HDHive 签到、转发监测、实时检测、错误；支持按来源筛选 |
+
+**配置导入/导出**：顶栏可导出当前配置 JSON 备份，或从 JSON 导入（适合迁移、多机同步）。敏感字段请自行脱敏后再分享。
+
+**会话说明**：控制台登录使用 HTTP-only Cookie（`tg_dashboard_session`），刷新页面无需在浏览器存密码；Telegram 的 `session_string` 保存在服务端 `.env`。
+
+### 本地目录与数据文件
+
+| 路径 | 说明 |
+|------|------|
+| `.env` | 主配置；控制台「保存配置」会写回此文件（Docker 挂载须**可写**） |
+| `data/` | Docker 默认数据卷挂载点：队列库 `tg_forwarder_queue.sqlite3` 等（对应容器 `/data`） |
+| `scripts/` | 扩展模块目录（`TG_MODULES_PATH`，Compose 默认 `/workspace/scripts`） |
+| `logs/` | 开启 `TG_FILE_LOG_ENABLED=true` 后的按天滚动日志 |
+| `frontend/` | 控制台 UI 源码；`npm run build` 产出到 `src/tg_forwarder/web/static/` |
+
+队列路径由 `TG_QUEUE_DB_PATH` 控制；本地直接运行时默认为项目下的路径，Docker 默认为 `/data/tg_forwarder_queue.sqlite3`。
+
+### 仅命令行运行（不用 Web）
+
+若已有 `config.yaml`（YAML 多 Worker 配置），可：
+
+```powershell
+python -m tg_forwarder validate -c config.yaml
+python -m tg_forwarder run -c config.yaml
 ```
 
-默认控制台密码：
-
-```text
-admin
-```
+日常仍推荐使用 Web：规则、队列、日志与 HDHive 均在控制台内完成。
 
 ## Docker 部署
 
@@ -162,26 +257,35 @@ docker compose up -d --build
 
 ### 2. 打开控制台
 
+Compose 将容器 **8080** 映射到主机 **8810**（见 `docker-compose.yaml`）：
+
 ```text
-http://127.0.0.1:8080
+http://127.0.0.1:8810
 ```
 
-### 3. 在容器里生成 `session_string`
+### 3. 登录 Telegram 与会话
 
-生产容器服务名为 **`tg-forwarder`**（默认就会起，无需设置 `COMPOSE_PROFILES`）：
+任选其一：
+
+| 方式 | 操作 |
+|------|------|
+| **网页（推荐）** | 浏览器打开 `http://127.0.0.1:8810` → 控制台密码 → **基础配置** 内扫码/验证码登录 |
+| **容器内命令行** | 见下方 `docker compose run … login` |
+
+生产服务名为 **`tg-forwarder`**（`docker compose up -d` 默认启动，无需 `COMPOSE_PROFILES`）：
 
 ```powershell
 docker compose run --rm tg-forwarder python -m tg_forwarder login --config /workspace/.env --save-env
 ```
 
-若你启用了开发容器（`.env` 里 `COMPOSE_PROFILES=true`），对应服务名为 **`tg-forwarder-dev`**，控制台在主机端口 **8081**（可用 `TG_DASHBOARD_DEV_PORT` 修改）。
+然后在控制台配置规则并 **启动后端**（与本地使用方式相同）。
 
 ### 4. 当前 Docker 说明（`docker-compose.yaml`）
 
-| 服务 | 默认是否启动 | 说明 |
-|------|--------------|------|
-| `tg-forwarder` | 是 | 生产：镜像内代码，挂 `./.env`（须**可写**，控制台会保存配置）与数据卷；`docker compose up -d` 即可 |
-| `tg-forwarder-dev` | 否 | 开发：需在 `.env` 写 `COMPOSE_PROFILES=true` 或命令行前加该变量；挂载整个 `./`，默认 **8081** 端口 |
+| 服务 | 默认是否启动 | 主机端口 | 说明 |
+|------|--------------|----------|------|
+| `tg-forwarder` | 是 | **8810** → 8080 | 生产：镜像内代码；挂 `./.env`（须**可写**）、`./data`、`./scripts` |
+| `tg-forwarder-dev` | 否 | **8081**（`TG_DASHBOARD_DEV_PORT`） | 开发：`.env` 中 `COMPOSE_PROFILES=true`；挂载整个项目目录 |
 
 开发时建议先停生产再只起开发，避免同一 Telegram 会话双实例：
 
@@ -192,12 +296,13 @@ $env:COMPOSE_PROFILES='true'; docker compose up -d --build
 
 恢复生产：`docker compose stop tg-forwarder-dev` 后执行 `docker compose up -d`。
 
-若曾出现 **`no service selected`**，是因为旧版 compose 要求必须设置 `COMPOSE_PROFILES`；当前仓库已改为生产服务无 profile，**直接 `docker compose up -d` 即可**。
-
-- 生产改代码需 **`docker compose build`** 再启动。
-- 内置 `healthcheck`（`GET /api/health`）；队列库在卷 `tg_forwarder_data`（`/data`），默认 SQLite **WAL**。
+- 生产改代码需 **`docker compose build`** 再启动；改 `frontend/` 也需重新 build 镜像。
+- 内置 `healthcheck`（`GET /api/health`）；队列库在 `./data`（容器 `/data`），默认 SQLite **WAL**。
+- 扩展模块默认目录：`./scripts`（环境变量 `TG_MODULES_PATH=/workspace/scripts`）。
 
 ## Web 控制台说明
+
+更完整的分区说明见上文 [控制台分区说明](#控制台分区说明)。本节补充字段含义、HDHive 与运维接口。
 
 ### 安全说明
 
@@ -206,99 +311,90 @@ $env:COMPOSE_PROFILES='true'; docker compose up -d --build
 - **不要**将控制台直接暴露到公网；若必须远程访问，请放在 HTTPS 反向代理后，并设置 `TG_DASHBOARD_COOKIE_SECURE=true`。
 - 未配置 `TG_DASHBOARD_CORS_ORIGINS` 时 **不启用 CORS**，适合浏览器与 API 同源访问；跨域场景请显式填写允许的来源列表。
 
-### 基础配置
+### 基础配置（要点）
 
-可以设置：
+| 项 | 说明 |
+|----|------|
+| API ID / HASH | 从 [my.telegram.org](https://my.telegram.org) 获取 |
+| 网页登录 Telegram | 验证码或扫码，成功后自动写入 `SESSION STRING` |
+| BOT TOKEN | 可选；多个用英文逗号分隔，按 bot#1 → bot#2 顺序尝试 |
+| 转发策略 | 全局默认；单条规则可设为「跟随全局」或覆盖 |
+| 全局限流 | 多规则同时命中时共用一个发送间隔，降低 FloodWait 风险 |
+| 启动通知 | 启动/重启后向已配置目标发一条通知（可自定义 HTML） |
+| 代理 | `TG_PROXY_*` 或 `TG_PROXY_URLS`；HDHive 可共用或单独配置 |
 
-- `API ID`
-- `API HASH`
-- `SESSION STRING`
-- `BOT TOKEN`
-- 全局发送策略
-- 限流保护
-- 启动通知
-- 代理
+Bot 会话目录：配置 `TG_BOT_SESSION_DIR` 后，Bot 使用磁盘 SQLite 会话，减轻重启时的 `ImportBotAuthorization` 限流。
 
-### 转发规则
+### 转发规则（要点）
 
-每条规则都可以独立设置：
+每条规则可独立配置：
 
-- 规则名称
-- 是否启用
-- 规则分组
-- 优先级（数字越小越靠前）
-- 源频道 / 群
-- 账号目标频道 / 群
-- Bot 目标频道 / 群
-- 规则级发送策略
-- 是否监听编辑消息
-- 是否转发自己发出的消息
-- 命中任一关键词
-- 必须全部命中
-- 黑名单关键词
-- 正则任一命中
-- 正则全部命中
-- 正则黑名单
-- 资源预设
-- 是否需要媒体
-- 是否需要文本
-- 内容匹配模式
-- 大小写敏感
+- 源（多个）、账号目标、Bot 目标、规则级发送策略（或跟随全局）
+- 关键词：任一命中 / 必须全部 / 黑名单；正则同理（一行一个）
+- **HDHive**：识别 `hdhive.com/resource/…` 并转发直链；可要求同时命中本规则关键词
+- 媒体/文本：`需要媒体`、`需要文本` 及 `all` / `any` 组合；**区分大小写**
+- 监听编辑、转发自己消息（测试用，注意避免源=目标造成循环）
+
+规则 JSON 中还可包含 `group`、`priority`（导入配置或 API 写入）；后端按 `priority → group → name` 排序。控制台 UI 以关键词/正则/HDHive 选项为主。
+
+### 站点设置（HDHive）
+
+与 **规则** 里 HDHive 直链转发配合使用：
+
+1. 选择签到方式：Premium（API Key）或非 Premium（网页用户名+密码，走 `hdhive_site_login_checkin.py`）。
+2. 配置 API Key、Cookie、自动签到与代理开关。
+3. 配置「自动解锁回退」积分上限（与转发 Worker 一致）。
+4. **测试签到** / **立即签到**、**检测转发路径**（不扣积分）、**真实解锁测试**（会扣积分）。
+
+签到与解锁是不同接口：签到失败时，只要 API Key 对分享/解锁有效，转发仍可能获取直链。
+
+### 扩展模块
+
+- 目录：默认 `scripts/`（或 `.env` 中 `TG_MODULES_PATH`）。
+- **导入模块 (.zip)**：包内需含 `module.json`；可选 `hooks.py`（`after_match`）、`web/index.html`（模块界面）。
+- 修改 `hooks.py` 后必须 **重启后端**；改 `config.json` 可通过模块界面或 API 保存。
 
 ### 历史搜索
 
-支持从所有已配置源频道中做模糊搜索。
+从**所有已配置源**做关键词模糊搜索，范围仅 Telegram 原消息：正文、caption、按钮文字、消息内链接文本。
 
-当前搜索范围只包含 Telegram 原消息本身：
+支持按频道筛选、**按已配置目标转发**、打开原消息链接。搜索模式由 `TG_SEARCH_DEFAULT_MODE` 控制（当前为 `fast`）。
 
-- 正文
-- caption
-- 按钮文字
-- 消息里直接带的链接文本
+### 运行与队列、日志
 
-搜索结果支持：
+| 能力 | 说明 |
+|------|------|
+| Worker 状态 | 每条启用规则对应一个监听进程；连续失败过多会暂停 |
+| Dispatcher | 本地 SQLite 队列；重启后继续未完成任务 |
+| 失败队列 | **重试失败任务** 为智能重试（跳过不可重试错误、FloodWait 冷却） |
+| 成功历史 | 按规则去重，可清空单规则或全部 |
+| 系统日志 | 筛选：全部 / HDHive 签到 / 转发监测 / 实时检测 / 错误 |
 
-- 按频道切换查看
-- 按规则默认目标直接转发
-- 打开原消息
+### 健康检查与诊断（API）
 
-### 状态、队列和日志
-
-后台可以查看：
-
-- 最近日志
-- 转发监控日志
-- 当前 worker 状态
-- dispatcher 状态
-- 失败任务队列
-- 成功历史统计
-- 健康状态（`/api/health`）
-- 诊断包导出（`/api/diagnostics/export`）
-
-### 健康检查与诊断
-
-- `GET /api/health`：返回服务状态、队列概览、日志缓冲占用、HDHive 签到状态
-- `GET /api/v1/health`：`/api/health` 的版本化别名
-- `GET /api/diagnostics/export`：导出诊断 JSON（脱敏 `.env`、健康状态、失败样本、近期日志）
-- 失败队列“重试”接口已升级为智能重试，返回重试数量与跳过统计
+- `GET /api/health`、`GET /api/v1/health`：服务状态、队列、HDHive 签到等
+- `GET /api/diagnostics/export`：脱敏配置 + 状态 + 失败样本 + 近期日志（JSON）
+- `GET /api/logs`：内存日志；`before_sequence` 分页拉取更早记录
 
 ### 控制台前端如何构建
 
-`frontend/vite.config.ts` 将构建产物输出到 `src/tg_forwarder/web/static`。修改 `frontend/src` 后在本机执行：
+`frontend/vite.config.ts` 将构建产物输出到 `src/tg_forwarder/web/static`。修改 `frontend/src` 后：
 
-```bash
+```powershell
 cd frontend
 npm install
 npm run build
 ```
 
-然后再启动或打包使用控制台的进程，即可加载最新界面。
+再启动 Web 或重新 `docker compose build`。详见 `frontend/README.md`。
 
 ### 故障排查（运维）
 
-- **Bot 登录出现 `FloodWaitError` / `ImportBotAuthorization` 限流**：设置环境变量 `TG_BOT_FLOODWAIT_MAX_SLEEP_SECONDS` 为略大于 Telegram 提示的等待秒数；适当增大 `TG_BOT_POOL_START_STAGGER_SECONDS`；并建议配置 `TG_BOT_SESSION_DIR`，让 Bot 使用磁盘上的 Telethon SQLite 会话，避免每次进程重启都重新走一遍机器人鉴权。
-- **日志显示已转发但目标频道看不到**：若使用 `account_first`，会优先用**登录账号**投递，成功时可能不再用 Bot；请查看「策略转发摘要」日志中的 `本轮投递=` 说明。
-- **日志 API**：`GET /api/logs` 返回 `items` 与 `total`（内存中条数）；可选查询参数 `before_sequence` 用于分页拉取更早的记录（值小于该序号的条目）。
+- **Bot 登录出现 `FloodWaitError` / `ImportBotAuthorization` 限流**：设置 `TG_BOT_FLOODWAIT_MAX_SLEEP_SECONDS` 略大于 Telegram 提示秒数；增大 `TG_BOT_POOL_START_STAGGER_SECONDS`；配置 `TG_BOT_SESSION_DIR`。
+- **日志显示已转发但目标频道看不到**：`account_first` 会优先用登录账号投递，成功时可能不再用 Bot；查看「策略转发摘要」中 `本轮投递=`。
+- **Docker 控制台打不开**：确认访问 **8810**（非 8080）；`docker compose ps` 与 `docker compose logs -f tg-forwarder`。
+- **保存配置失败**：检查 `.env` 挂载是否可写；每行须为 `KEY=value` 或注释，勿粘贴裸 URL 行（见 `.env.example` 顶部说明）。
+- **队列库损坏**：备份后删除或重建 `TG_QUEUE_DB_PATH` 指向的 sqlite 文件（见 `.env.example` 中 `TG_QUEUE_DB_PATH` 注释）。
 
 ## 发送策略
 
@@ -344,7 +440,7 @@ npm run build
 
 那么消息里必须同时包含这两个条件。
 
-### 命中任一关键词 / 任一正则 / 资源预设
+### 命中任一关键词 / 任一正则
 
 这一组只要命中一个即可。
 
@@ -358,6 +454,8 @@ npm run build
 ```
 
 消息里只要出现其中一个，就算通过这组条件。
+
+若规则开启 **HDHive 直链转发**，消息中出现 `hdhive.com/resource/…` 时会尝试解析为可转发直链（可与关键词/正则组合，见规则页说明）。
 
 ### 媒体和文本组合
 
@@ -386,29 +484,18 @@ npm run build
 
 ### 测试实时自动转发
 
-1. 使用账号 A 生成 `session_string`
-2. 让账号 A 加入源群和目标群
-3. 如果要测试 Bot 转发，把 Bot 拉进目标群并给它发言权限
-4. 在后台新增一条规则
-5. 保存配置
-6. 校验配置
-7. 启动后端
-8. 使用另一个账号 B 往源群发消息
-9. 查看目标群是否收到
+1. 在 **基础配置** 完成 Telegram 登录（或 CLI `login`）。
+2. 确保监听账号已加入**源**与**目标**；若测 Bot 发送，将 Bot 拉入目标群并授权。
+3. **规则设置** 新增规则 → 顶栏 **保存配置** → **校验配置** → **启动后端**。
+4. 用**另一个账号**往源群发测试消息（勿用监听账号自己发，除非开启「转发自己发送的消息」）。
+5. 在 **系统日志**（转发监测）与目标群确认；**运行与队列** 可看 Worker 与 Dispatcher。
 
-注意：
-
-- 默认不会转发当前登录账号自己发出的消息
-- 测试时建议用另一个账号发消息
-- 如果源和目标配成同一个地方，要注意避免循环转发
+注意：源与目标相同且开启「转发自己消息」时可能循环转发。
 
 ### 测试历史搜索和指定转发
 
-1. 打开“搜索”
-2. 输入关键词
-3. 点击搜索
-4. 找到对应消息
-5. 点击“按已配置目标转发”
+1. 打开 **消息搜索**，输入关键词 → **搜索所有源**。
+2. 按频道筛选结果 → **按已配置目标转发** 或打开原消息。
 
 ## 常见问题
 
@@ -450,6 +537,37 @@ npm run build
 - 容器网络与宿主机网络环境不同
 
 这种错误一般只影响“启动通知”，不一定代表主转发逻辑已经完全不可用。
+
+## Telegraph 解析（`tgph/`，独立于 HDHive）
+
+当消息带有 **[telegra.ph](https://telegra.ph/)** 文章链接时，由 `tgph/` **单独**拉取文章 HTML，用规则里的关键词 / 正则对**页面内容**判断（不是对 Telegram 消息正文，也与 HDHive 站点设置无关），再提取文内直链（如 `115cdn.com/s/…`）作为转发正文。
+
+| 模块 | 作用 |
+|------|------|
+| `tgph/fetch.py` | 拉取 Telegraph HTML |
+| `tgph/content.py` | 从 HTML 提取可检索正文 |
+| `tgph/match.py` | 按规则对**页面 HTML** 做关键词 / 正则匹配 |
+| `tgph/resolve.py` | `resolve_tgph_dispatch_text` — 匹配通过后提取直链 |
+| `tgph/cli.py` | 命令行自测页面匹配与直链提取 |
+
+**规则示例**（[示例文章](https://telegra.ph/星辰光辉更胜太阳-更新412集-1080P-amzn源-官方简体中文字幕332GB神秘G-10-24)）：
+
+- 勾选 **Telegraph：解析 telegra.ph 文章 HTML 并转发文内直链**
+- 勾选 **仅当 Telegraph 页面 HTML 命中下方关键词/正则时才转发**
+- **命中任一关键词** 填 `115cdn` 或 `4K`（须出现在文章 HTML 中）
+
+详见 [`tgph/RULE_EXAMPLE.md`](tgph/RULE_EXAMPLE.md)。
+
+```powershell
+$env:PYTHONPATH = "src;."
+python -m tgph.cli --require-match --keyword 115cdn --pretty "https://telegra.ph/你的文章路径"
+```
+
+Docker / 本地需 `PYTHONPATH` 含仓库根目录（Compose：`/workspace/src:/workspace`）。
+
+拉取 `telegra.ph` 会复用 **基础配置** 里的 `TG_PROXY_*`（与 Telegram 相同）。容器内若出现 `Network is unreachable`，请在控制台填好代理并保存配置。
+
+---
 
 ## 仓库内 HDHive 工具（`hdhive/`）
 
@@ -521,21 +639,26 @@ python hdhive/auto_unlock.py --api-key "KEY" --slug "SLUG" --allow-paid --max-po
 ## 项目结构
 
 ```text
-frontend/                Vite + Vue 3 控制台源码（npm run build 产出到 web/static）
-hdhive/                  HDHive：网页签到脚本、OpenAPI CLI、自动解锁辅助与包入口
+frontend/                Vite + Vue 3 控制台源码（npm run build → web/static）
+tgph/                    Telegraph 独立解析（telegra.ph HTML 匹配 → 文内直链）
+hdhive/                  HDHive：网页签到、OpenAPI CLI（hdhive.py）、auto_unlock.py
+data/                    Docker 默认数据目录（队列库等，挂载为 /data）
+scripts/                 扩展模块目录（TG_MODULES_PATH，可 zip 导入）
 src/tg_forwarder/
-  cli.py                 命令行入口
-  webapp.py              FastAPI Web 控制台
-  supervisor.py          worker 进程管理
-  worker.py              实时监听和命中判断
+  cli.py                 命令行：web / login / validate / run
+  webapp.py              FastAPI 控制台与 REST API
+  supervisor.py          Worker 进程管理
+  worker.py              实时监听与规则匹配
   dispatcher.py          发送队列调度
-  dispatch_queue.py      队列与历史记录
-  forwarder.py           账号 / Bot 发送逻辑
-  filters.py             规则匹配逻辑
-  dashboard_actions.py   搜索和手动转发
-  startup_notifier.py    启动通知
-  telegram_clients.py    Telegram 客户端与代理连接
-  web/static/            构建后的静态资源（index.html、assets/ 等）
+  dispatch_queue.py      队列与成功历史
+  forwarder.py           账号 / Bot 发送
+  filters.py             关键词、正则、媒体文本匹配
+  modules/               扩展模块加载（hooks.after_match）
+  dashboard_actions.py   历史搜索与手动转发
+  hdhive_*.py            HDHive 签到、资源解析与解锁
+  web/static/            构建后的控制台静态资源
+docker-compose.yaml      生产 8810、开发 8081（profile）
+.env.example             环境变量说明模板
 ```
 
 ## 开源发布前建议
